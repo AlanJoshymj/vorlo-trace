@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vorlo-trace"
+version = "0.1.0"
+description = "AI agent observability SDK — see exactly why your agent failed, in 30 seconds."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Alan Joshy", email = "alan@vorlo.dev"},
+]
+keywords = [
+    "ai", "agent", "observability", "debugging", "langchain",
+    "tracing", "llm", "mcp", "step-replay", "vorlo",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "langchain-core>=0.1.0",
+    "requests>=2.28.0",
+]
+
+[project.optional-dependencies]
+async = ["httpx>=0.24.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-mock>=3.10",
+    "httpx>=0.24.0",
+]
+
+[project.urls]
+Homepage = "https://vorlo.dev"
+Documentation = "https://docs.vorlo.dev"
+Repository = "https://github.com/AlanJoshymj/vorlo-trace"
+Issues = "https://github.com/AlanJoshymj/vorlo-trace/issues"
+Changelog = "https://github.com/AlanJoshymj/vorlo-trace/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vorlo_trace"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
