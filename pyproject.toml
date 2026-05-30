@@ -36,6 +36,10 @@ dependencies = [
 
 [project.optional-dependencies]
 async = ["httpx>=0.24.0"]
+examples = [
+    "langchain-openai>=0.1.0",
+    "langgraph>=0.1.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-mock>=3.10",
