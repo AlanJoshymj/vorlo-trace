@@ -113,9 +113,10 @@ def main() -> None:
             print(f"  ✗ Failed: {e}")
 
     print("\n" + "=" * 60)
+    handler._sender.flush(timeout=5.0)
     print(f"Session complete. {handler._session.step_count} steps recorded.")
     print(f"Duration: {handler._session.duration_ms}ms")
-    print(f"\nView this session at: https://vorlo.dev/session/{handler.session_id}")
+    print(f"\nView this session at: https://vorlo.dev/sessions/{handler.session_id}")
 
 
 if __name__ == "__main__":
