@@ -136,6 +136,7 @@ class VorloHandler(BaseCallbackHandler):
                 "input": _truncate(input_str, _MAX_INPUT_CHARS),
                 "start_time": time.time(),
                 "span_id": span_id,
+                "parent_span_id": "",
                 "reasoning": _truncate(reasoning, _MAX_REASONING_CHARS) if reasoning else "",
             }
         except Exception:
@@ -447,6 +448,7 @@ class VorloHandler(BaseCallbackHandler):
             "session_id": self._session.session_id,
             "trace_id": self._session.trace_id,
             "span_id": step_data["span_id"],
+            "parent_span_id": step_data.get("parent_span_id", ""),
             "agent_name": self._session.agent_name,
             "api_key": self._api_key,
             "step_number": step_data["step_number"],

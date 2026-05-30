@@ -166,11 +166,13 @@ def _to_trace_payload(event: dict[str, Any]) -> Optional[dict[str, Any]]:
         "previous_step_context": event.get("previous_step_context", []),
         "trace_id": event.get("trace_id", ""),
         "span_id": event.get("span_id", ""),
+        "parent_span_id": event.get("parent_span_id", ""),
         "created_at": event.get("created_at") or datetime.now(timezone.utc).isoformat(),
     }
 
     return {
         "session_id": event.get("session_id", ""),
+        "agent_name": event.get("agent_name", ""),
         "api_key": event.get("api_key", ""),
         "step": step,
     }
