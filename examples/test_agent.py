@@ -13,6 +13,7 @@ Run with:
 import os
 import sys
 import time
+import json
 
 # Add src to path so we can import vorlo_trace without installing
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -79,6 +80,12 @@ def main() -> None:
 
     import uuid
 
+    tool_inputs = {
+        "get_customer": {"customer_id": "cus_ABC123", "include": ["email", "plan", "billing_status"]},
+        "search_orders": {"customer_id": "cus_ABC123", "status": "pending", "limit": 3},
+        "charge_card": {"customer_id": "cus_ABC123", "order_id": "ord_123", "amount": 4999, "currency": "usd"},
+        "send_email": {"to": "jane@example.com", "subject": "Payment issue", "template": "payment_failed_retry"},
+    }
     tools = [get_customer, search_orders, charge_card, send_email]
 
     for i, tool_fn in enumerate(tools):
@@ -89,19 +96,19 @@ def main() -> None:
         # Simulate on_tool_start
         handler.on_tool_start(
             serialized={"name": tool_name},
-            input_str=f"test input for {tool_name}",
+            input_str=json.dumps(tool_inputs[tool_name], indent=2),
             run_id=run_id,
         )
 
         try:
             if tool_name == "get_customer":
-                result = get_customer.invoke({"customer_id": "cus_ABC123"})
+                result = get_customer.invoke({"customer_id": tool_inputs[tool_name]["customer_id"]})
             elif tool_name == "search_orders":
-                result = search_orders.invoke({"query": "pending orders"})
+                result = search_orders.invoke({"query": "pending orders for cus_ABC123"})
             elif tool_name == "charge_card":
                 result = charge_card.invoke({"customer_id": "cus_ABC123", "amount": 4999})
             elif tool_name == "send_email":
-                result = send_email.invoke({"to": "jane@example.com", "subject": "Receipt", "body": "Thanks!"})
+                result = send_email.invoke({"to": "jane@example.com", "subject": "Payment issue", "body": "We could not complete your payment."})
             else:
                 result = "ok"
 
