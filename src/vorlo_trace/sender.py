@@ -68,6 +68,9 @@ class AsyncSender:
         If the queue is full (server has been unreachable for too long),
         the event is silently dropped.
         """
+        if event.get("event_type") != "step":
+            return
+
         try:
             self._queue.put_nowait(event)
         except queue.Full:
