@@ -97,6 +97,37 @@ class VorloHandler(BaseCallbackHandler):
         # Per-tool-call state (keyed by run_id to handle concurrent calls)
         self._active_steps: dict[str, dict[str, Any]] = {}
 
+        # OTel span registry — maps every run_id (chain, llm, tool) to a span_id
+        # so a child run can resolve its parent_span_id from parent_run_id.
+        # This is what links nested-agent and sub-chain steps into one trace tree.
+        self._span_by_run: dict[str, str] = {}
+
+    # ── Span registry helpers ────────────────────────────────────────────
+
+    # Hard cap so a stream of un-paired start events can never leak memory.
+    _MAX_TRACKED_SPANS = 5000
+
+    def _register_span(self, run_id: uuid.UUID) -> str:
+        """Get or create the span ID for a run. Idempotent per run_id."""
+        key = str(run_id)
+        span_id = self._span_by_run.get(key)
+        if span_id is None:
+            if len(self._span_by_run) >= self._MAX_TRACKED_SPANS:
+                self._span_by_run.clear()
+            span_id = self._session.generate_span_id()
+            self._span_by_run[key] = span_id
+        return span_id
+
+    def _resolve_parent_span(self, parent_run_id: Optional[uuid.UUID]) -> str:
+        """Return the span ID of the parent run, or '' if it is the root."""
+        if parent_run_id is None:
+            return ""
+        return self._span_by_run.get(str(parent_run_id), "")
+
+    def _release_span(self, run_id: uuid.UUID) -> None:
+        """Drop a run's span once it has ended. Safe if already gone."""
+        self._span_by_run.pop(str(run_id), None)
+
     # ── Properties ───────────────────────────────────────────────────────
 
     @property
@@ -126,7 +157,8 @@ class VorloHandler(BaseCallbackHandler):
             tool_name = serialized.get("name", "") or serialized.get("id", ["unknown"])[-1]
             step_number = self._session.next_step()
             tool_type = _classify_tool(tool_name)
-            span_id = self._session.generate_span_id()
+            span_id = self._register_span(run_id)
+            parent_span_id = self._resolve_parent_span(parent_run_id)
             reasoning = self._session.consume_reasoning()
 
             self._active_steps[str(run_id)] = {
@@ -136,7 +168,7 @@ class VorloHandler(BaseCallbackHandler):
                 "input": _truncate(input_str, _MAX_INPUT_CHARS),
                 "start_time": time.time(),
                 "span_id": span_id,
-                "parent_span_id": "",
+                "parent_span_id": parent_span_id,
                 "reasoning": _truncate(reasoning, _MAX_REASONING_CHARS) if reasoning else "",
             }
         except Exception:
@@ -152,6 +184,7 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when a tool completes successfully."""
         try:
+            self._release_span(run_id)
             step_data = self._active_steps.pop(str(run_id), None)
             if step_data is None:
                 return
@@ -192,6 +225,7 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when a tool raises an error."""
         try:
+            self._release_span(run_id)
             step_data = self._active_steps.pop(str(run_id), None)
             if step_data is None:
                 return
@@ -249,6 +283,7 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when the LLM starts generating. Captures the prompt as reasoning input."""
         try:
+            self._register_span(run_id)
             # Store the prompt — this becomes the "why" in step replay
             combined = "\n".join(prompts) if prompts else ""
             self._session.set_reasoning(_truncate(combined, _MAX_REASONING_CHARS))
@@ -265,6 +300,7 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when the LLM finishes generating. Captures the decision output."""
         try:
+            self._release_span(run_id)
             if response.generations:
                 # Get the text of the first generation — this contains the agent's decision
                 first_gen = response.generations[0]
@@ -343,6 +379,7 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when a chain starts. Marks session start for top-level chains."""
         try:
+            self._register_span(run_id)
             if parent_run_id is None:
                 # Top-level chain — this is the session start
                 event = {
@@ -367,6 +404,7 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when a chain ends."""
         try:
+            self._release_span(run_id)
             if parent_run_id is None:
                 event = {
                     "event_type": "session_complete",
@@ -393,6 +431,7 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when a chain errors. Sends session_error for top-level chains."""
         try:
+            self._release_span(run_id)
             if parent_run_id is None:
                 event = {
                     "event_type": "session_error",
@@ -422,6 +461,7 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when a chat model starts. Captures messages as reasoning."""
         try:
+            self._register_span(run_id)
             all_messages = []
             for msg_list in messages:
                 for msg in msg_list:
