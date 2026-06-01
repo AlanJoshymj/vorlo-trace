@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vorlo-trace"
-version = "0.1.0"
+version = "0.1.1"
 description = "AI agent observability SDK — see exactly why your agent failed, in 30 seconds."
 readme = "README.md"
 license = {text = "MIT"}
@@ -48,10 +48,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://vorlo.dev"
-Documentation = "https://docs.vorlo.dev"
-Repository = "https://github.com/AlanJoshymj/vorlo-trace"
-Issues = "https://github.com/AlanJoshymj/vorlo-trace/issues"
-Changelog = "https://github.com/AlanJoshymj/vorlo-trace/blob/main/CHANGELOG.md"
+Documentation = "https://vorlo.dev/#how"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vorlo_trace"]
