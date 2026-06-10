@@ -15,7 +15,7 @@ import vorlo_trace
 from vorlo_trace.handler import VorloHandler, _classify_tool, _extract_http_status
 from vorlo_trace.error_translator import translate_error, ErrorDiagnosis
 from vorlo_trace.session import VorloSession
-from vorlo_trace.sender import AsyncSender, _to_trace_payload
+from vorlo_trace.sender import AsyncSender, _to_session_payload, _to_trace_payload
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -390,6 +390,50 @@ class TestSenderNeverBlocks:
 
     def test_lifecycle_events_are_not_sent_to_trace_endpoint(self) -> None:
         assert _to_trace_payload({"event_type": "session_start"}) is None
+
+    def test_session_event_converts_to_session_payload(self) -> None:
+        payload = _to_session_payload({
+            "event_type": "session_complete",
+            "session_id": "sess_123",
+            "api_key": "vrlo_test",
+            "agent_name": "order-agent",
+            "trace_id": "a" * 32,
+            "total_steps": 5,
+            "duration_ms": 1234,
+            "status": "success",
+            "output": "{'result': 'done'}",
+        })
+
+        assert payload is not None
+        assert payload["session_id"] == "sess_123"
+        assert payload["event_type"] == "session_complete"
+        assert payload["total_steps"] == 5
+        assert payload["duration_ms"] == 1234
+        assert payload["status"] == "success"
+
+    def test_step_events_are_not_session_payloads(self) -> None:
+        assert _to_session_payload({"event_type": "step"}) is None
+
+    def test_sender_routes_session_events_to_session_endpoint(self) -> None:
+        """Lifecycle events must reach /v1/session, steps /v1/trace."""
+        sender = AsyncSender(server_url="http://localhost:3001", api_key="test")
+        sent: list[str] = []
+        sender._session.post = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda url, **kw: sent.append(url) or MagicMock(status_code=200)
+        )
+
+        sender.send({"event_type": "step", "session_id": "s1", "api_key": "k"})
+        sender.send({
+            "event_type": "session_complete",
+            "session_id": "s1",
+            "api_key": "k",
+            "status": "success",
+        })
+        sender.flush()
+        sender.shutdown()
+
+        assert any(url.endswith("/v1/trace") for url in sent)
+        assert any(url.endswith("/v1/session") for url in sent)
 
 
 class TestSdkInitialization:
