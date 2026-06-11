@@ -481,12 +481,12 @@ def _generic_diagnosis(ctx: dict[str, Any]) -> ErrorDiagnosis:
         title=f"Tool '{ctx['tool_name']}' failed{status_part}",
         plain_english=(
             f"The tool '{ctx['tool_name']}' encountered an error: "
-            f"{_truncate(ctx['raw_message'], 200)}. "
+            f"{truncate_keep_tail(ctx['raw_message'], 200)}. "
             "Vorlo could not match this to a known error pattern."
         ),
         root_cause=(
             f"Error type: {ctx['error_type']}. "
-            f"Raw message: {_truncate(ctx['raw_message'], 300)}. "
+            f"Raw message: {truncate_keep_tail(ctx['raw_message'], 300)}. "
             "This error does not match any known pattern in the Vorlo error catalog. "
             "If you see this frequently, report it so we can add a specific diagnosis."
         ),
@@ -505,3 +505,16 @@ def _truncate(text: str, max_length: int) -> str:
     if len(text) <= max_length:
         return text
     return text[: max_length - 3] + "..."
+
+
+def truncate_keep_tail(text: str, max_length: int) -> str:
+    """
+    Truncate keeping both head and tail. Python tracebacks put the actual
+    exception on the LAST line, so head-only truncation would show the
+    'Traceback (most recent call last)' boilerplate and cut the error itself.
+    """
+    if len(text) <= max_length:
+        return text
+    head = max_length // 3
+    tail = max_length - head - 5
+    return f"{text[:head]} ... {text[-tail:]}"

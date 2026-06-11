@@ -61,6 +61,11 @@ class AsyncSender:
         )
         self._thread.start()
 
+    # Event types we know how to deliver; anything else is dropped.
+    _KNOWN_EVENT_TYPES = frozenset(
+        {"step", "session_start", "session_complete", "session_error"}
+    )
+
     def send(self, event: dict[str, Any]) -> None:
         """
         Enqueue an event for async sending. Never blocks, never raises.
@@ -68,7 +73,7 @@ class AsyncSender:
         If the queue is full (server has been unreachable for too long),
         the event is silently dropped.
         """
-        if event.get("event_type") != "step":
+        if event.get("event_type") not in self._KNOWN_EVENT_TYPES:
             return
 
         try:
@@ -96,7 +101,8 @@ class AsyncSender:
 
     def _worker(self) -> None:
         """Background worker: reads events from queue and sends them."""
-        endpoint = f"{self._server_url}/v1/trace"
+        trace_endpoint = f"{self._server_url}/v1/trace"
+        session_endpoint = f"{self._server_url}/v1/session"
         while True:
             try:
                 event = self._queue.get()
@@ -104,7 +110,10 @@ class AsyncSender:
                     # Sentinel value — shutdown requested
                     self._queue.task_done()
                     break
-                self._send_event(endpoint, event)
+                if event.get("event_type") == "step":
+                    self._send_event(trace_endpoint, event)
+                else:
+                    self._send_event(session_endpoint, event)
                 self._queue.task_done()
             except Exception:
                 # Never let the worker thread die from an unexpected error
@@ -117,7 +126,10 @@ class AsyncSender:
 
     def _send_event(self, endpoint: str, event: dict[str, Any]) -> None:
         """Send a single event to the Vorlo server. Silent on failure."""
-        payload = _to_trace_payload(event)
+        if event.get("event_type") == "step":
+            payload = _to_trace_payload(event)
+        else:
+            payload = _to_session_payload(event)
         if payload is None:
             return
 
@@ -179,3 +191,31 @@ def _to_trace_payload(event: dict[str, Any]) -> Optional[dict[str, Any]]:
         "api_key": event.get("api_key", ""),
         "step": step,
     }
+
+
+_SESSION_EVENT_TYPES = frozenset({"session_start", "session_complete", "session_error"})
+
+
+def _to_session_payload(event: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Convert SDK lifecycle event shape into the server's /v1/session contract."""
+    event_type = event.get("event_type")
+    if event_type not in _SESSION_EVENT_TYPES:
+        return None
+
+    payload: dict[str, Any] = {
+        "session_id": event.get("session_id", ""),
+        "api_key": event.get("api_key", ""),
+        "event_type": event_type,
+        "agent_name": event.get("agent_name", ""),
+        "trace_id": event.get("trace_id", ""),
+        "input": str(event.get("input") or ""),
+        "output": str(event.get("output") or ""),
+        "error": str(event.get("error") or ""),
+        "total_steps": int(event.get("total_steps") or 0),
+        "duration_ms": int(event.get("duration_ms") or 0),
+        "created_at": event.get("created_at") or datetime.now(timezone.utc).isoformat(),
+    }
+    status = event.get("status")
+    if status in ("running", "success", "failed"):
+        payload["status"] = status
+    return payload

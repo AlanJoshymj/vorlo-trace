@@ -57,7 +57,13 @@ class VorloSession:
         self.start_time: float = time.time()
         self.step_count: int = 0
         self._previous_steps: deque[StepSummary] = deque(maxlen=_MAX_PREVIOUS_STEPS)
-        self._current_reasoning: Optional[str] = None
+        # Pending reasoning / token usage keyed by scope (the parent run id).
+        # The LLM call that decides a tool call and the tool call itself share
+        # a parent run, so scoping prevents parallel tool calls from stealing
+        # each other's reasoning. "" is the global scope for flat runs.
+        self._reasoning_by_scope: dict[str, str] = {}
+        self._tokens_by_scope: dict[str, int] = {}
+        self.total_tokens: int = 0
 
     def next_step(self) -> int:
         """Increment and return the next step number."""
@@ -92,15 +98,46 @@ class VorloSession:
         """Return previous step summaries as a list of dicts."""
         return [s.to_dict() for s in self._previous_steps]
 
-    def set_reasoning(self, reasoning: str) -> None:
-        """Store the LLM's reasoning/chain-of-thought before a tool call."""
-        self._current_reasoning = reasoning
+    # Hard cap so chains that never call tools cannot leak pending state.
+    _MAX_PENDING_SCOPES = 200
 
-    def consume_reasoning(self) -> Optional[str]:
-        """Return and clear the stored reasoning. Called once per tool call."""
-        reasoning = self._current_reasoning
-        self._current_reasoning = None
+    def set_reasoning(self, reasoning: str, scope: str = "") -> None:
+        """Store the LLM's reasoning/chain-of-thought before a tool call."""
+        if len(self._reasoning_by_scope) >= self._MAX_PENDING_SCOPES:
+            self._reasoning_by_scope.clear()
+        self._reasoning_by_scope[scope] = reasoning
+
+    def consume_reasoning(self, scope: str = "") -> Optional[str]:
+        """
+        Return and clear the stored reasoning for a scope. Falls back to the
+        global scope, then to a sole pending entry — nested runnable chains can
+        put the LLM under a different parent than the tool, and with only one
+        agent running that single entry is unambiguous.
+        """
+        reasoning = self._reasoning_by_scope.pop(scope, None)
+        if reasoning is None and scope != "":
+            reasoning = self._reasoning_by_scope.pop("", None)
+        if reasoning is None and len(self._reasoning_by_scope) == 1:
+            reasoning = self._reasoning_by_scope.popitem()[1]
         return reasoning
+
+    def add_tokens(self, count: int, scope: str = "") -> None:
+        """Accumulate token usage from LLM calls since the last tool start."""
+        if count > 0:
+            if len(self._tokens_by_scope) >= self._MAX_PENDING_SCOPES:
+                self._tokens_by_scope.clear()
+            self._tokens_by_scope[scope] = self._tokens_by_scope.get(scope, 0) + count
+            self.total_tokens += count
+
+    def consume_tokens(self, scope: str = "") -> int:
+        """Return and reset the pending token count for a scope (same fallbacks
+        as consume_reasoning)."""
+        tokens = self._tokens_by_scope.pop(scope, 0)
+        if tokens == 0 and scope != "":
+            tokens = self._tokens_by_scope.pop("", 0)
+        if tokens == 0 and len(self._tokens_by_scope) == 1:
+            tokens = self._tokens_by_scope.popitem()[1]
+        return tokens
 
     def get_context(self) -> dict[str, Any]:
         """Return full session context dict for inclusion in trace events."""

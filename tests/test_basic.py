@@ -15,7 +15,7 @@ import vorlo_trace
 from vorlo_trace.handler import VorloHandler, _classify_tool, _extract_http_status
 from vorlo_trace.error_translator import translate_error, ErrorDiagnosis
 from vorlo_trace.session import VorloSession
-from vorlo_trace.sender import AsyncSender, _to_trace_payload
+from vorlo_trace.sender import AsyncSender, _to_session_payload, _to_trace_payload
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -53,10 +53,25 @@ class TestHttpStatusExtraction:
         assert _extract_http_status("HTTP 403 Forbidden") == 403
         assert _extract_http_status("Error: 500 Internal Server Error") == 500
         assert _extract_http_status("Rate limited: 429") == 429
+        assert _extract_http_status("ToolError: 403 (charge_card)") == 403
+        assert _extract_http_status("Request req_8a2Xj returned 403") == 403
+        assert _extract_http_status("server responded with 502") == 502
+        assert _extract_http_status("status_code=404") == 404
+        assert _extract_http_status("got a 429 Too Many Requests") == 429
+        assert _extract_http_status("HTTP/1.1 503 Service Unavailable") == 503
 
     def test_no_status(self) -> None:
         assert _extract_http_status("Connection refused") is None
         assert _extract_http_status("KeyError: 'name'") is None
+
+    def test_bare_numbers_are_not_status_codes(self) -> None:
+        """A wrong diagnosis is worse than none — 3-digit numbers without
+        HTTP context must never be treated as status codes."""
+        assert _extract_http_status("KeyError at line 403 of utils.py") is None
+        assert _extract_http_status("Processed 404 items in batch") is None
+        assert _extract_http_status("customer id 503 not found in table") is None
+        assert _extract_http_status("retried after 500 ms") is None
+        assert _extract_http_status("port 443 connection reset") is None
 
 
 class TestHandlerToolCallbacks:
@@ -101,6 +116,163 @@ class TestHandlerToolCallbacks:
         assert event["tool_name"] == "search_orders"
         assert event["tool_type"] == "sensor"
         assert event["step_number"] == 1
+
+    def test_redact_scrubs_all_captured_fields(self) -> None:
+        handler = VorloHandler(
+            server_url="http://localhost:3001",
+            api_key="vrlo_test_key",
+            agent_name="redact-test",
+            redact=lambda text: text.replace("jane@x.com", "[EMAIL]"),
+        )
+        handler._sender = MagicMock(spec=AsyncSender)
+
+        run_id = uuid.uuid4()
+        handler.on_tool_start(
+            serialized={"name": "send_email"},
+            input_str="to=jane@x.com subject=hi",
+            run_id=run_id,
+        )
+        handler.on_tool_end(output="sent to jane@x.com", run_id=run_id)
+
+        event = handler._sender.send.call_args[0][0]
+        assert "jane@x.com" not in event["input"]
+        assert "jane@x.com" not in event["output"]
+        assert "[EMAIL]" in event["input"]
+
+    def test_redact_failure_drops_content_instead_of_leaking(self) -> None:
+        def broken_redact(_text: str) -> str:
+            raise RuntimeError("boom")
+
+        handler = VorloHandler(
+            server_url="http://localhost:3001",
+            api_key="vrlo_test_key",
+            redact=broken_redact,
+        )
+        handler._sender = MagicMock(spec=AsyncSender)
+
+        run_id = uuid.uuid4()
+        handler.on_tool_start(
+            serialized={"name": "send_email"},
+            input_str="ssn=123-45-6789",
+            run_id=run_id,
+        )
+        handler.on_tool_end(output="ok", run_id=run_id)
+
+        event = handler._sender.send.call_args[0][0]
+        assert "123-45-6789" not in event["input"]
+        assert "redact callback raised" in event["input"]
+
+    def test_generic_diagnosis_keeps_the_traceback_tail(self) -> None:
+        boilerplate = "Traceback (most recent call last):\n" + (
+            '  File "agent.py", line 847, in _call\n    result = tool.invoke(input)\n' * 20
+        )
+        raw = boilerplate + "ValueError: schema mismatch on field 'customer_id'"
+        diagnosis = translate_error(
+            tool_name="parse_response",
+            error_type="ValueError",
+            http_status=None,
+            raw_message=raw,
+            previous_steps=[],
+        )
+        assert diagnosis.code == "unknown_error"
+        assert "customer_id" in diagnosis.root_cause
+
+    def test_parallel_agents_do_not_swap_reasoning(self) -> None:
+        """Reasoning is scoped by parent run — two agents running tools
+        concurrently must each get their own LLM's reasoning."""
+        from langchain_core.outputs import Generation, LLMResult
+
+        parent_a, parent_b = uuid.uuid4(), uuid.uuid4()
+
+        self.handler.on_llm_start(
+            serialized={}, prompts=["plan for agent A"],
+            run_id=uuid.uuid4(), parent_run_id=parent_a,
+        )
+        self.handler.on_llm_start(
+            serialized={}, prompts=["plan for agent B"],
+            run_id=uuid.uuid4(), parent_run_id=parent_b,
+        )
+
+        # Agent B's tool starts FIRST — under the old single-slot model it
+        # would have stolen whichever reasoning was written last.
+        tool_b, tool_a = uuid.uuid4(), uuid.uuid4()
+        self.handler.on_tool_start(
+            serialized={"name": "tool_b"}, input_str="", run_id=tool_b, parent_run_id=parent_b
+        )
+        self.handler.on_tool_start(
+            serialized={"name": "tool_a"}, input_str="", run_id=tool_a, parent_run_id=parent_a
+        )
+
+        assert "agent B" in self.handler._active_steps[str(tool_b)]["reasoning"]
+        assert "agent A" in self.handler._active_steps[str(tool_a)]["reasoning"]
+
+    def test_single_agent_reasoning_survives_mismatched_parents(self) -> None:
+        """Nested runnable chains can give the LLM a different parent than the
+        tool — with one agent running, the sole pending entry must still attach."""
+        self.handler.on_llm_start(
+            serialized={}, prompts=["the only plan"],
+            run_id=uuid.uuid4(), parent_run_id=uuid.uuid4(),  # some inner chain
+        )
+        tool_run = uuid.uuid4()
+        self.handler.on_tool_start(
+            serialized={"name": "tool_x"}, input_str="",
+            run_id=tool_run, parent_run_id=uuid.uuid4(),  # different parent
+        )
+        assert "the only plan" in self.handler._active_steps[str(tool_run)]["reasoning"]
+
+    def test_token_usage_is_attached_to_the_next_step(self) -> None:
+        from langchain_core.outputs import Generation, LLMResult
+
+        response = LLMResult(
+            generations=[[Generation(text="call search_orders")]],
+            llm_output={"token_usage": {"total_tokens": 123}},
+        )
+        self.handler.on_llm_end(response, run_id=uuid.uuid4())
+
+        run_id = uuid.uuid4()
+        self.handler.on_tool_start(
+            serialized={"name": "search_orders"}, input_str="q", run_id=run_id
+        )
+        self.handler.on_tool_end(output="ok", run_id=run_id)
+
+        event = self.handler._sender.send.call_args[0][0]
+        assert event["cost_tokens"] == 123
+
+        # A second step without an LLM call in between carries no tokens
+        run_id2 = uuid.uuid4()
+        self.handler.on_tool_start(
+            serialized={"name": "get_customer"}, input_str="id=1", run_id=run_id2
+        )
+        self.handler.on_tool_end(output="ok", run_id=run_id2)
+        event2 = self.handler._sender.send.call_args[0][0]
+        assert event2["cost_tokens"] == 0
+
+    def test_token_usage_from_anthropic_and_usage_metadata_shapes(self) -> None:
+        from langchain_core.outputs import Generation, LLMResult
+
+        from vorlo_trace.handler import _extract_total_tokens
+
+        anthropic_shape = LLMResult(
+            generations=[[Generation(text="x")]],
+            llm_output={"usage": {"input_tokens": 40, "output_tokens": 2}},
+        )
+        assert _extract_total_tokens(anthropic_shape) == 42
+
+        class _Msg:
+            usage_metadata = {"input_tokens": 10, "output_tokens": 5}
+
+        class _Gen:
+            text = "x"
+            message = _Msg()
+
+        class _Result:
+            llm_output = None
+            generations = [[_Gen()]]
+
+        assert _extract_total_tokens(_Result()) == 15  # type: ignore[arg-type]
+
+        no_usage = LLMResult(generations=[[Generation(text="x")]])
+        assert _extract_total_tokens(no_usage) == 0
 
     def test_tool_error_sends_failed_event_with_diagnosis(self) -> None:
         run_id = uuid.uuid4()
@@ -390,6 +562,50 @@ class TestSenderNeverBlocks:
 
     def test_lifecycle_events_are_not_sent_to_trace_endpoint(self) -> None:
         assert _to_trace_payload({"event_type": "session_start"}) is None
+
+    def test_session_event_converts_to_session_payload(self) -> None:
+        payload = _to_session_payload({
+            "event_type": "session_complete",
+            "session_id": "sess_123",
+            "api_key": "vrlo_test",
+            "agent_name": "order-agent",
+            "trace_id": "a" * 32,
+            "total_steps": 5,
+            "duration_ms": 1234,
+            "status": "success",
+            "output": "{'result': 'done'}",
+        })
+
+        assert payload is not None
+        assert payload["session_id"] == "sess_123"
+        assert payload["event_type"] == "session_complete"
+        assert payload["total_steps"] == 5
+        assert payload["duration_ms"] == 1234
+        assert payload["status"] == "success"
+
+    def test_step_events_are_not_session_payloads(self) -> None:
+        assert _to_session_payload({"event_type": "step"}) is None
+
+    def test_sender_routes_session_events_to_session_endpoint(self) -> None:
+        """Lifecycle events must reach /v1/session, steps /v1/trace."""
+        sender = AsyncSender(server_url="http://localhost:3001", api_key="test")
+        sent: list[str] = []
+        sender._session.post = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda url, **kw: sent.append(url) or MagicMock(status_code=200)
+        )
+
+        sender.send({"event_type": "step", "session_id": "s1", "api_key": "k"})
+        sender.send({
+            "event_type": "session_complete",
+            "session_id": "s1",
+            "api_key": "k",
+            "status": "success",
+        })
+        sender.flush()
+        sender.shutdown()
+
+        assert any(url.endswith("/v1/trace") for url in sent)
+        assert any(url.endswith("/v1/session") for url in sent)
 
 
 class TestSdkInitialization:

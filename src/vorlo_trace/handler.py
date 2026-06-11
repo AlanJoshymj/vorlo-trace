@@ -18,14 +18,18 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from langchain_core.agents import AgentAction, AgentFinish
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from vorlo_trace.error_translator import ErrorDiagnosis, translate_error
+from vorlo_trace.error_translator import (
+    ErrorDiagnosis,
+    translate_error,
+    truncate_keep_tail,
+)
 from vorlo_trace.sender import AsyncSender
 from vorlo_trace.session import VorloSession
 
@@ -65,6 +69,11 @@ def _safe_str(value: Any) -> str:
         return "<unserializable>"
 
 
+def _scope(run_id: Optional[uuid.UUID]) -> str:
+    """Scope key for pending reasoning/tokens — the parent run, '' for flat runs."""
+    return str(run_id) if run_id else ""
+
+
 class VorloHandler(BaseCallbackHandler):
     """
     LangChain callback handler that captures agent execution steps
@@ -84,6 +93,7 @@ class VorloHandler(BaseCallbackHandler):
         api_key: str,
         agent_name: str = "default",
         verify_ssl: bool = True,
+        redact: Optional[Callable[[str], str]] = None,
     ) -> None:
         super().__init__()
         self._sender = AsyncSender(
@@ -93,6 +103,7 @@ class VorloHandler(BaseCallbackHandler):
         )
         self._session = VorloSession(agent_name=agent_name)
         self._api_key = api_key
+        self._redact = redact
 
         # Per-tool-call state (keyed by run_id to handle concurrent calls)
         self._active_steps: dict[str, dict[str, Any]] = {}
@@ -101,6 +112,19 @@ class VorloHandler(BaseCallbackHandler):
         # so a child run can resolve its parent_span_id from parent_run_id.
         # This is what links nested-agent and sub-chain steps into one trace tree.
         self._span_by_run: dict[str, str] = {}
+
+    def _scrub(self, text: str) -> str:
+        """
+        Apply the user's redact callback before anything leaves the process.
+        If the callback raises we drop the content rather than ship it raw —
+        the privacy-safe failure mode.
+        """
+        if not self._redact or not text:
+            return text
+        try:
+            return str(self._redact(text))
+        except Exception:
+            return "<redacted: redact callback raised>"
 
     # ── Span registry helpers ────────────────────────────────────────────
 
@@ -159,17 +183,19 @@ class VorloHandler(BaseCallbackHandler):
             tool_type = _classify_tool(tool_name)
             span_id = self._register_span(run_id)
             parent_span_id = self._resolve_parent_span(parent_run_id)
-            reasoning = self._session.consume_reasoning()
+            reasoning = self._session.consume_reasoning(scope=_scope(parent_run_id))
 
             self._active_steps[str(run_id)] = {
                 "step_number": step_number,
                 "tool_name": tool_name,
                 "tool_type": tool_type,
-                "input": _truncate(input_str, _MAX_INPUT_CHARS),
+                "input": _truncate(self._scrub(input_str), _MAX_INPUT_CHARS),
                 "start_time": time.time(),
                 "span_id": span_id,
                 "parent_span_id": parent_span_id,
                 "reasoning": _truncate(reasoning, _MAX_REASONING_CHARS) if reasoning else "",
+                # Tokens spent by the LLM call(s) that decided this tool call
+                "cost_tokens": self._session.consume_tokens(scope=_scope(parent_run_id)),
             }
         except Exception:
             pass  # never affect the agent
@@ -189,7 +215,7 @@ class VorloHandler(BaseCallbackHandler):
             if step_data is None:
                 return
 
-            output_str = _truncate(_safe_str(output), _MAX_OUTPUT_CHARS)
+            output_str = _truncate(self._scrub(_safe_str(output)), _MAX_OUTPUT_CHARS)
             latency_ms = int((time.time() - step_data["start_time"]) * 1000)
 
             # Build event BEFORE adding to previous steps — context should
@@ -231,7 +257,8 @@ class VorloHandler(BaseCallbackHandler):
                 return
 
             latency_ms = int((time.time() - step_data["start_time"]) * 1000)
-            error_str = _safe_str(error)
+            # Scrub BEFORE translating so PII never reaches the diagnosis text
+            error_str = self._scrub(_safe_str(error))
 
             # Extract HTTP status if present in the error message
             http_status = _extract_http_status(error_str)
@@ -284,9 +311,12 @@ class VorloHandler(BaseCallbackHandler):
         """Called when the LLM starts generating. Captures the prompt as reasoning input."""
         try:
             self._register_span(run_id)
-            # Store the prompt — this becomes the "why" in step replay
+            # Store the prompt — this becomes the "why" in step replay.
+            # Scoped by parent run so parallel agents don't steal each other's reasoning.
             combined = "\n".join(prompts) if prompts else ""
-            self._session.set_reasoning(_truncate(combined, _MAX_REASONING_CHARS))
+            self._session.set_reasoning(
+                _truncate(combined, _MAX_REASONING_CHARS), scope=_scope(parent_run_id)
+            )
         except Exception:
             pass
 
@@ -301,15 +331,19 @@ class VorloHandler(BaseCallbackHandler):
         """Called when the LLM finishes generating. Captures the decision output."""
         try:
             self._release_span(run_id)
+            scope = _scope(parent_run_id)
+            self._session.add_tokens(_extract_total_tokens(response), scope=scope)
             if response.generations:
                 # Get the text of the first generation — this contains the agent's decision
                 first_gen = response.generations[0]
                 if first_gen:
                     text = first_gen[0].text if first_gen[0].text else ""
                     # Append LLM output to reasoning so we capture both input and decision
-                    current = self._session.consume_reasoning() or ""
+                    current = self._session.consume_reasoning(scope=scope) or ""
                     combined = f"{current}\n---LLM OUTPUT---\n{text}" if current else text
-                    self._session.set_reasoning(_truncate(combined, _MAX_REASONING_CHARS))
+                    self._session.set_reasoning(
+                        _truncate(combined, _MAX_REASONING_CHARS), scope=scope
+                    )
         except Exception:
             pass
 
@@ -325,8 +359,14 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when the agent decides which tool to call."""
         try:
+            # Agent actions fire on the executor's chain run, and tools started
+            # by that executor get THIS run_id as their parent — so the scope
+            # for the upcoming tool is run_id, not parent_run_id. The LLM call
+            # that produced this decision stored its reasoning under the same
+            # scope (its parent is also the executor run).
+            scope = _scope(run_id)
             reasoning_parts = []
-            current = self._session.consume_reasoning()
+            current = self._session.consume_reasoning(scope=scope)
             if current:
                 reasoning_parts.append(current)
             reasoning_parts.append(
@@ -336,7 +376,7 @@ class VorloHandler(BaseCallbackHandler):
             if action.log:
                 reasoning_parts.append(f"Agent reasoning: {_truncate(action.log, 1000)}")
             self._session.set_reasoning(
-                _truncate("\n".join(reasoning_parts), _MAX_REASONING_CHARS)
+                _truncate("\n".join(reasoning_parts), _MAX_REASONING_CHARS), scope=scope
             )
         except Exception:
             pass
@@ -360,7 +400,7 @@ class VorloHandler(BaseCallbackHandler):
                 "total_steps": self._session.step_count,
                 "duration_ms": self._session.duration_ms,
                 "status": "success",
-                "output": _truncate(_safe_str(finish.return_values), _MAX_OUTPUT_CHARS),
+                "output": _truncate(self._scrub(_safe_str(finish.return_values)), _MAX_OUTPUT_CHARS),
             }
             self._sender.send(event)
         except Exception:
@@ -388,7 +428,7 @@ class VorloHandler(BaseCallbackHandler):
                     "trace_id": self._session.trace_id,
                     "agent_name": self._session.agent_name,
                     "api_key": self._api_key,
-                    "input": _truncate(_safe_str(inputs), _MAX_INPUT_CHARS),
+                    "input": _truncate(self._scrub(_safe_str(inputs)), _MAX_INPUT_CHARS),
                 }
                 self._sender.send(event)
         except Exception:
@@ -415,7 +455,7 @@ class VorloHandler(BaseCallbackHandler):
                     "total_steps": self._session.step_count,
                     "duration_ms": self._session.duration_ms,
                     "status": "success",
-                    "output": _truncate(_safe_str(outputs), _MAX_OUTPUT_CHARS),
+                    "output": _truncate(self._scrub(_safe_str(outputs)), _MAX_OUTPUT_CHARS),
                 }
                 self._sender.send(event)
         except Exception:
@@ -442,7 +482,8 @@ class VorloHandler(BaseCallbackHandler):
                     "total_steps": self._session.step_count,
                     "duration_ms": self._session.duration_ms,
                     "status": "failed",
-                    "error": _truncate(_safe_str(error), _MAX_OUTPUT_CHARS),
+                    # Tail-preserving: the exception is on the LAST line of a traceback
+                    "error": truncate_keep_tail(self._scrub(_safe_str(error)), _MAX_OUTPUT_CHARS),
                 }
                 self._sender.send(event)
         except Exception:
@@ -467,7 +508,9 @@ class VorloHandler(BaseCallbackHandler):
                 for msg in msg_list:
                     all_messages.append(f"[{msg.type}] {msg.content}")
             combined = "\n".join(all_messages)
-            self._session.set_reasoning(_truncate(combined, _MAX_REASONING_CHARS))
+            self._session.set_reasoning(
+                _truncate(combined, _MAX_REASONING_CHARS), scope=_scope(parent_run_id)
+            )
         except Exception:
             pass
 
@@ -498,7 +541,8 @@ class VorloHandler(BaseCallbackHandler):
             "output": output,
             "status": status,
             "latency_ms": latency_ms,
-            "reasoning": step_data.get("reasoning", ""),
+            "cost_tokens": step_data.get("cost_tokens", 0),
+            "reasoning": self._scrub(step_data.get("reasoning", "")),
             "previous_step_context": self._session.get_previous_steps(),
         }
 
@@ -521,14 +565,84 @@ class VorloHandler(BaseCallbackHandler):
 
 # ── Utility ──────────────────────────────────────────────────────────────
 
-_HTTP_STATUS_RE = re.compile(r"\b([1-5]\d{2})\b")
+def _extract_total_tokens(response: LLMResult) -> int:
+    """
+    Extract total token usage from an LLMResult, across provider shapes:
+    OpenAI-style llm_output["token_usage"], Anthropic-style llm_output["usage"],
+    and per-message usage_metadata (newer LangChain chat models).
+    Returns 0 when usage is unavailable — never raises.
+    """
+    try:
+        llm_output = getattr(response, "llm_output", None) or {}
+        usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+        if usage:
+            total = usage.get("total_tokens")
+            if total is None:
+                total = (
+                    (usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                    + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                )
+            if total:
+                return int(total)
+
+        for gen_list in getattr(response, "generations", None) or []:
+            for gen in gen_list:
+                meta = getattr(getattr(gen, "message", None), "usage_metadata", None)
+                if meta:
+                    total = meta.get("total_tokens") or (
+                        (meta.get("input_tokens") or 0) + (meta.get("output_tokens") or 0)
+                    )
+                    if total:
+                        return int(total)
+    except Exception:
+        pass
+    return 0
+
+
+# A bare \b([1-5]\d{2})\b would treat ANY 3-digit number as an HTTP status
+# ("KeyError at line 403 of utils.py" → diagnosed as 403 Forbidden), and a
+# wrong diagnosis is worse than none. Only extract a code when it appears in
+# an HTTP-shaped context.
+_HTTP_STATUS_PATTERNS = [
+    # "HTTP 403", "HTTP/1.1 403", "HTTPS 503", "http status: 403"
+    re.compile(r"\bhttps?(?:/\d\.\d)?\s*(?:status)?\s*[:=]?\s*([1-5]\d{2})\b", re.I),
+    # "status code 403", "status: 403", "status_code=403", "StatusCode: 429"
+    re.compile(r"\bstatus(?:[ _-]?code)?\s*[:=]?\s*([1-5]\d{2})\b", re.I),
+    # "error code: 429", "code=503"
+    re.compile(r"\b(?:error\s+)?code\s*[:=]\s*([1-5]\d{2})\b", re.I),
+    # "returned 503", "responded with 502", "got a 404", "received 429"
+    re.compile(r"\b(?:returned|respond(?:ed)?\s+with|got(?:\s+a)?|received)\s+([1-5]\d{2})\b", re.I),
+    # "SomeError: 403", "ToolError(429)" — a code immediately after an error label
+    re.compile(r"\b\w*(?:error|exception)\w*\s*[:(]\s*([1-5]\d{2})\b", re.I),
+    # "rate limited: 429", "rate limit (429)"
+    re.compile(r"\brate[ -]?limit\w*\s*[:=(]?\s*([1-5]\d{2})\b", re.I),
+    # "403 Forbidden", "429 Too Many Requests" — a code paired with ITS OWN
+    # canonical reason phrase ("503 not found in table" must not match).
+    re.compile(
+        r"\b(?:"
+        r"(400)\s+bad request|(401)\s+unauthorized|(402)\s+payment required|"
+        r"(403)\s+forbidden|(404)\s+not found|(405)\s+method not allowed|"
+        r"(406)\s+not acceptable|(408)\s+request timeout|(409)\s+conflict|"
+        r"(410)\s+gone|(412)\s+precondition failed|(413)\s+payload too large|"
+        r"(422)\s+unprocessable|(429)\s+too many requests|"
+        r"(500)\s+internal server error|(501)\s+not implemented|"
+        r"(502)\s+bad gateway|(503)\s+service unavailable|(504)\s+gateway timeout"
+        r")\b",
+        re.I,
+    ),
+]
 
 
 def _extract_http_status(error_message: str) -> Optional[int]:
-    """Try to extract an HTTP status code from an error message string."""
-    match = _HTTP_STATUS_RE.search(error_message)
-    if match:
-        code = int(match.group(1))
-        if 100 <= code <= 599:
-            return code
+    """Extract an HTTP status code from an error message, requiring HTTP context."""
+    for pattern in _HTTP_STATUS_PATTERNS:
+        match = pattern.search(error_message)
+        if match:
+            # The paired code+reason pattern has many groups; take the one that hit.
+            code_str = next((g for g in match.groups() if g), None)
+            if code_str is None:
+                continue
+            code = int(code_str)
+            if 100 <= code <= 599:
+                return code
     return None
