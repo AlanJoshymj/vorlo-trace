@@ -15,7 +15,7 @@ Add 2 lines of code to see exactly why your agent failed:
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from vorlo_trace.handler import VorloHandler
 
@@ -34,6 +34,7 @@ def init(
     server_url: Optional[str] = None,
     agent_name: str = "default",
     verify_ssl: Optional[bool] = None,
+    redact: Optional[Callable[[str], str]] = None,
 ) -> VorloHandler:
     """
     Initialize the Vorlo trace SDK.
@@ -46,6 +47,10 @@ def init(
         verify_ssl: Whether to verify TLS certificates. Defaults to True.
                 Can be overridden with VORLO_VERIFY_SSL=false for local
                 corporate proxy testing.
+        redact: Optional callback applied to every captured string (tool
+                inputs/outputs, errors, reasoning) BEFORE it leaves the
+                process — use it to scrub PII or secrets. If it raises, the
+                content is dropped rather than shipped raw.
 
     Returns:
         The VorloHandler instance (also stored as module singleton).
@@ -77,6 +82,7 @@ def init(
         api_key=resolved_key,
         agent_name=agent_name,
         verify_ssl=resolved_verify_ssl,
+        redact=redact,
     )
     return _handler
 

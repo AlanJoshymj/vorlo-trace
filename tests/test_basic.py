@@ -117,6 +117,66 @@ class TestHandlerToolCallbacks:
         assert event["tool_type"] == "sensor"
         assert event["step_number"] == 1
 
+    def test_redact_scrubs_all_captured_fields(self) -> None:
+        handler = VorloHandler(
+            server_url="http://localhost:3001",
+            api_key="vrlo_test_key",
+            agent_name="redact-test",
+            redact=lambda text: text.replace("jane@x.com", "[EMAIL]"),
+        )
+        handler._sender = MagicMock(spec=AsyncSender)
+
+        run_id = uuid.uuid4()
+        handler.on_tool_start(
+            serialized={"name": "send_email"},
+            input_str="to=jane@x.com subject=hi",
+            run_id=run_id,
+        )
+        handler.on_tool_end(output="sent to jane@x.com", run_id=run_id)
+
+        event = handler._sender.send.call_args[0][0]
+        assert "jane@x.com" not in event["input"]
+        assert "jane@x.com" not in event["output"]
+        assert "[EMAIL]" in event["input"]
+
+    def test_redact_failure_drops_content_instead_of_leaking(self) -> None:
+        def broken_redact(_text: str) -> str:
+            raise RuntimeError("boom")
+
+        handler = VorloHandler(
+            server_url="http://localhost:3001",
+            api_key="vrlo_test_key",
+            redact=broken_redact,
+        )
+        handler._sender = MagicMock(spec=AsyncSender)
+
+        run_id = uuid.uuid4()
+        handler.on_tool_start(
+            serialized={"name": "send_email"},
+            input_str="ssn=123-45-6789",
+            run_id=run_id,
+        )
+        handler.on_tool_end(output="ok", run_id=run_id)
+
+        event = handler._sender.send.call_args[0][0]
+        assert "123-45-6789" not in event["input"]
+        assert "redact callback raised" in event["input"]
+
+    def test_generic_diagnosis_keeps_the_traceback_tail(self) -> None:
+        boilerplate = "Traceback (most recent call last):\n" + (
+            '  File "agent.py", line 847, in _call\n    result = tool.invoke(input)\n' * 20
+        )
+        raw = boilerplate + "ValueError: schema mismatch on field 'customer_id'"
+        diagnosis = translate_error(
+            tool_name="parse_response",
+            error_type="ValueError",
+            http_status=None,
+            raw_message=raw,
+            previous_steps=[],
+        )
+        assert diagnosis.code == "unknown_error"
+        assert "customer_id" in diagnosis.root_cause
+
     def test_parallel_agents_do_not_swap_reasoning(self) -> None:
         """Reasoning is scoped by parent run — two agents running tools
         concurrently must each get their own LLM's reasoning."""

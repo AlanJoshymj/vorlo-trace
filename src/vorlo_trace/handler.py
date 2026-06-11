@@ -18,14 +18,18 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from langchain_core.agents import AgentAction, AgentFinish
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
-from vorlo_trace.error_translator import ErrorDiagnosis, translate_error
+from vorlo_trace.error_translator import (
+    ErrorDiagnosis,
+    translate_error,
+    truncate_keep_tail,
+)
 from vorlo_trace.sender import AsyncSender
 from vorlo_trace.session import VorloSession
 
@@ -89,6 +93,7 @@ class VorloHandler(BaseCallbackHandler):
         api_key: str,
         agent_name: str = "default",
         verify_ssl: bool = True,
+        redact: Optional[Callable[[str], str]] = None,
     ) -> None:
         super().__init__()
         self._sender = AsyncSender(
@@ -98,6 +103,7 @@ class VorloHandler(BaseCallbackHandler):
         )
         self._session = VorloSession(agent_name=agent_name)
         self._api_key = api_key
+        self._redact = redact
 
         # Per-tool-call state (keyed by run_id to handle concurrent calls)
         self._active_steps: dict[str, dict[str, Any]] = {}
@@ -106,6 +112,19 @@ class VorloHandler(BaseCallbackHandler):
         # so a child run can resolve its parent_span_id from parent_run_id.
         # This is what links nested-agent and sub-chain steps into one trace tree.
         self._span_by_run: dict[str, str] = {}
+
+    def _scrub(self, text: str) -> str:
+        """
+        Apply the user's redact callback before anything leaves the process.
+        If the callback raises we drop the content rather than ship it raw —
+        the privacy-safe failure mode.
+        """
+        if not self._redact or not text:
+            return text
+        try:
+            return str(self._redact(text))
+        except Exception:
+            return "<redacted: redact callback raised>"
 
     # ── Span registry helpers ────────────────────────────────────────────
 
@@ -170,7 +189,7 @@ class VorloHandler(BaseCallbackHandler):
                 "step_number": step_number,
                 "tool_name": tool_name,
                 "tool_type": tool_type,
-                "input": _truncate(input_str, _MAX_INPUT_CHARS),
+                "input": _truncate(self._scrub(input_str), _MAX_INPUT_CHARS),
                 "start_time": time.time(),
                 "span_id": span_id,
                 "parent_span_id": parent_span_id,
@@ -196,7 +215,7 @@ class VorloHandler(BaseCallbackHandler):
             if step_data is None:
                 return
 
-            output_str = _truncate(_safe_str(output), _MAX_OUTPUT_CHARS)
+            output_str = _truncate(self._scrub(_safe_str(output)), _MAX_OUTPUT_CHARS)
             latency_ms = int((time.time() - step_data["start_time"]) * 1000)
 
             # Build event BEFORE adding to previous steps — context should
@@ -238,7 +257,8 @@ class VorloHandler(BaseCallbackHandler):
                 return
 
             latency_ms = int((time.time() - step_data["start_time"]) * 1000)
-            error_str = _safe_str(error)
+            # Scrub BEFORE translating so PII never reaches the diagnosis text
+            error_str = self._scrub(_safe_str(error))
 
             # Extract HTTP status if present in the error message
             http_status = _extract_http_status(error_str)
@@ -380,7 +400,7 @@ class VorloHandler(BaseCallbackHandler):
                 "total_steps": self._session.step_count,
                 "duration_ms": self._session.duration_ms,
                 "status": "success",
-                "output": _truncate(_safe_str(finish.return_values), _MAX_OUTPUT_CHARS),
+                "output": _truncate(self._scrub(_safe_str(finish.return_values)), _MAX_OUTPUT_CHARS),
             }
             self._sender.send(event)
         except Exception:
@@ -408,7 +428,7 @@ class VorloHandler(BaseCallbackHandler):
                     "trace_id": self._session.trace_id,
                     "agent_name": self._session.agent_name,
                     "api_key": self._api_key,
-                    "input": _truncate(_safe_str(inputs), _MAX_INPUT_CHARS),
+                    "input": _truncate(self._scrub(_safe_str(inputs)), _MAX_INPUT_CHARS),
                 }
                 self._sender.send(event)
         except Exception:
@@ -435,7 +455,7 @@ class VorloHandler(BaseCallbackHandler):
                     "total_steps": self._session.step_count,
                     "duration_ms": self._session.duration_ms,
                     "status": "success",
-                    "output": _truncate(_safe_str(outputs), _MAX_OUTPUT_CHARS),
+                    "output": _truncate(self._scrub(_safe_str(outputs)), _MAX_OUTPUT_CHARS),
                 }
                 self._sender.send(event)
         except Exception:
@@ -462,7 +482,8 @@ class VorloHandler(BaseCallbackHandler):
                     "total_steps": self._session.step_count,
                     "duration_ms": self._session.duration_ms,
                     "status": "failed",
-                    "error": _truncate(_safe_str(error), _MAX_OUTPUT_CHARS),
+                    # Tail-preserving: the exception is on the LAST line of a traceback
+                    "error": truncate_keep_tail(self._scrub(_safe_str(error)), _MAX_OUTPUT_CHARS),
                 }
                 self._sender.send(event)
         except Exception:
@@ -521,7 +542,7 @@ class VorloHandler(BaseCallbackHandler):
             "status": status,
             "latency_ms": latency_ms,
             "cost_tokens": step_data.get("cost_tokens", 0),
-            "reasoning": step_data.get("reasoning", ""),
+            "reasoning": self._scrub(step_data.get("reasoning", "")),
             "previous_step_context": self._session.get_previous_steps(),
         }
 
