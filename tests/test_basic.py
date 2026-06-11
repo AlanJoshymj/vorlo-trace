@@ -53,10 +53,25 @@ class TestHttpStatusExtraction:
         assert _extract_http_status("HTTP 403 Forbidden") == 403
         assert _extract_http_status("Error: 500 Internal Server Error") == 500
         assert _extract_http_status("Rate limited: 429") == 429
+        assert _extract_http_status("ToolError: 403 (charge_card)") == 403
+        assert _extract_http_status("Request req_8a2Xj returned 403") == 403
+        assert _extract_http_status("server responded with 502") == 502
+        assert _extract_http_status("status_code=404") == 404
+        assert _extract_http_status("got a 429 Too Many Requests") == 429
+        assert _extract_http_status("HTTP/1.1 503 Service Unavailable") == 503
 
     def test_no_status(self) -> None:
         assert _extract_http_status("Connection refused") is None
         assert _extract_http_status("KeyError: 'name'") is None
+
+    def test_bare_numbers_are_not_status_codes(self) -> None:
+        """A wrong diagnosis is worse than none — 3-digit numbers without
+        HTTP context must never be treated as status codes."""
+        assert _extract_http_status("KeyError at line 403 of utils.py") is None
+        assert _extract_http_status("Processed 404 items in batch") is None
+        assert _extract_http_status("customer id 503 not found in table") is None
+        assert _extract_http_status("retried after 500 ms") is None
+        assert _extract_http_status("port 443 connection reset") is None
 
 
 class TestHandlerToolCallbacks:

@@ -521,14 +521,50 @@ class VorloHandler(BaseCallbackHandler):
 
 # ── Utility ──────────────────────────────────────────────────────────────
 
-_HTTP_STATUS_RE = re.compile(r"\b([1-5]\d{2})\b")
+# A bare \b([1-5]\d{2})\b would treat ANY 3-digit number as an HTTP status
+# ("KeyError at line 403 of utils.py" → diagnosed as 403 Forbidden), and a
+# wrong diagnosis is worse than none. Only extract a code when it appears in
+# an HTTP-shaped context.
+_HTTP_STATUS_PATTERNS = [
+    # "HTTP 403", "HTTP/1.1 403", "HTTPS 503", "http status: 403"
+    re.compile(r"\bhttps?(?:/\d\.\d)?\s*(?:status)?\s*[:=]?\s*([1-5]\d{2})\b", re.I),
+    # "status code 403", "status: 403", "status_code=403", "StatusCode: 429"
+    re.compile(r"\bstatus(?:[ _-]?code)?\s*[:=]?\s*([1-5]\d{2})\b", re.I),
+    # "error code: 429", "code=503"
+    re.compile(r"\b(?:error\s+)?code\s*[:=]\s*([1-5]\d{2})\b", re.I),
+    # "returned 503", "responded with 502", "got a 404", "received 429"
+    re.compile(r"\b(?:returned|respond(?:ed)?\s+with|got(?:\s+a)?|received)\s+([1-5]\d{2})\b", re.I),
+    # "SomeError: 403", "ToolError(429)" — a code immediately after an error label
+    re.compile(r"\b\w*(?:error|exception)\w*\s*[:(]\s*([1-5]\d{2})\b", re.I),
+    # "rate limited: 429", "rate limit (429)"
+    re.compile(r"\brate[ -]?limit\w*\s*[:=(]?\s*([1-5]\d{2})\b", re.I),
+    # "403 Forbidden", "429 Too Many Requests" — a code paired with ITS OWN
+    # canonical reason phrase ("503 not found in table" must not match).
+    re.compile(
+        r"\b(?:"
+        r"(400)\s+bad request|(401)\s+unauthorized|(402)\s+payment required|"
+        r"(403)\s+forbidden|(404)\s+not found|(405)\s+method not allowed|"
+        r"(406)\s+not acceptable|(408)\s+request timeout|(409)\s+conflict|"
+        r"(410)\s+gone|(412)\s+precondition failed|(413)\s+payload too large|"
+        r"(422)\s+unprocessable|(429)\s+too many requests|"
+        r"(500)\s+internal server error|(501)\s+not implemented|"
+        r"(502)\s+bad gateway|(503)\s+service unavailable|(504)\s+gateway timeout"
+        r")\b",
+        re.I,
+    ),
+]
 
 
 def _extract_http_status(error_message: str) -> Optional[int]:
-    """Try to extract an HTTP status code from an error message string."""
-    match = _HTTP_STATUS_RE.search(error_message)
-    if match:
-        code = int(match.group(1))
-        if 100 <= code <= 599:
-            return code
+    """Extract an HTTP status code from an error message, requiring HTTP context."""
+    for pattern in _HTTP_STATUS_PATTERNS:
+        match = pattern.search(error_message)
+        if match:
+            # The paired code+reason pattern has many groups; take the one that hit.
+            code_str = next((g for g in match.groups() if g), None)
+            if code_str is None:
+                continue
+            code = int(code_str)
+            if 100 <= code <= 599:
+                return code
     return None
