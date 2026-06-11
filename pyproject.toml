@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vorlo-trace"
-version = "0.1.1"
+version = "0.2.0"
 description = "AI agent observability SDK — see exactly why your agent failed, in 30 seconds."
 readme = "README.md"
 license = {text = "MIT"}

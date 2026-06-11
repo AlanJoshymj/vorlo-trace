@@ -52,7 +52,7 @@ class AsyncSender:
         self._session.headers.update({
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self._api_key}",
-            "User-Agent": "vorlo-trace-sdk/0.1.0",
+            "User-Agent": "vorlo-trace-sdk/0.2.0",
         })
         self._thread = threading.Thread(
             target=self._worker,
