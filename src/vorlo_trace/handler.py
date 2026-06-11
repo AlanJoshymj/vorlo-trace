@@ -170,6 +170,8 @@ class VorloHandler(BaseCallbackHandler):
                 "span_id": span_id,
                 "parent_span_id": parent_span_id,
                 "reasoning": _truncate(reasoning, _MAX_REASONING_CHARS) if reasoning else "",
+                # Tokens spent by the LLM call(s) that decided this tool call
+                "cost_tokens": self._session.consume_tokens(),
             }
         except Exception:
             pass  # never affect the agent
@@ -301,6 +303,7 @@ class VorloHandler(BaseCallbackHandler):
         """Called when the LLM finishes generating. Captures the decision output."""
         try:
             self._release_span(run_id)
+            self._session.add_tokens(_extract_total_tokens(response))
             if response.generations:
                 # Get the text of the first generation — this contains the agent's decision
                 first_gen = response.generations[0]
@@ -498,6 +501,7 @@ class VorloHandler(BaseCallbackHandler):
             "output": output,
             "status": status,
             "latency_ms": latency_ms,
+            "cost_tokens": step_data.get("cost_tokens", 0),
             "reasoning": step_data.get("reasoning", ""),
             "previous_step_context": self._session.get_previous_steps(),
         }
@@ -520,6 +524,40 @@ class VorloHandler(BaseCallbackHandler):
 
 
 # ── Utility ──────────────────────────────────────────────────────────────
+
+def _extract_total_tokens(response: LLMResult) -> int:
+    """
+    Extract total token usage from an LLMResult, across provider shapes:
+    OpenAI-style llm_output["token_usage"], Anthropic-style llm_output["usage"],
+    and per-message usage_metadata (newer LangChain chat models).
+    Returns 0 when usage is unavailable — never raises.
+    """
+    try:
+        llm_output = getattr(response, "llm_output", None) or {}
+        usage = llm_output.get("token_usage") or llm_output.get("usage") or {}
+        if usage:
+            total = usage.get("total_tokens")
+            if total is None:
+                total = (
+                    (usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                    + (usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                )
+            if total:
+                return int(total)
+
+        for gen_list in getattr(response, "generations", None) or []:
+            for gen in gen_list:
+                meta = getattr(getattr(gen, "message", None), "usage_metadata", None)
+                if meta:
+                    total = meta.get("total_tokens") or (
+                        (meta.get("input_tokens") or 0) + (meta.get("output_tokens") or 0)
+                    )
+                    if total:
+                        return int(total)
+    except Exception:
+        pass
+    return 0
+
 
 # A bare \b([1-5]\d{2})\b would treat ANY 3-digit number as an HTTP status
 # ("KeyError at line 403 of utils.py" → diagnosed as 403 Forbidden), and a

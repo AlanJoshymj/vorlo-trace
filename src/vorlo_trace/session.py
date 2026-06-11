@@ -58,6 +58,8 @@ class VorloSession:
         self.step_count: int = 0
         self._previous_steps: deque[StepSummary] = deque(maxlen=_MAX_PREVIOUS_STEPS)
         self._current_reasoning: Optional[str] = None
+        self._pending_tokens: int = 0
+        self.total_tokens: int = 0
 
     def next_step(self) -> int:
         """Increment and return the next step number."""
@@ -101,6 +103,18 @@ class VorloSession:
         reasoning = self._current_reasoning
         self._current_reasoning = None
         return reasoning
+
+    def add_tokens(self, count: int) -> None:
+        """Accumulate token usage from LLM calls since the last tool start."""
+        if count > 0:
+            self._pending_tokens += count
+            self.total_tokens += count
+
+    def consume_tokens(self) -> int:
+        """Return and reset the pending token count. Called once per tool call."""
+        tokens = self._pending_tokens
+        self._pending_tokens = 0
+        return tokens
 
     def get_context(self) -> dict[str, Any]:
         """Return full session context dict for inclusion in trace events."""

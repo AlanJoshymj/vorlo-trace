@@ -117,6 +117,60 @@ class TestHandlerToolCallbacks:
         assert event["tool_type"] == "sensor"
         assert event["step_number"] == 1
 
+    def test_token_usage_is_attached_to_the_next_step(self) -> None:
+        from langchain_core.outputs import Generation, LLMResult
+
+        response = LLMResult(
+            generations=[[Generation(text="call search_orders")]],
+            llm_output={"token_usage": {"total_tokens": 123}},
+        )
+        self.handler.on_llm_end(response, run_id=uuid.uuid4())
+
+        run_id = uuid.uuid4()
+        self.handler.on_tool_start(
+            serialized={"name": "search_orders"}, input_str="q", run_id=run_id
+        )
+        self.handler.on_tool_end(output="ok", run_id=run_id)
+
+        event = self.handler._sender.send.call_args[0][0]
+        assert event["cost_tokens"] == 123
+
+        # A second step without an LLM call in between carries no tokens
+        run_id2 = uuid.uuid4()
+        self.handler.on_tool_start(
+            serialized={"name": "get_customer"}, input_str="id=1", run_id=run_id2
+        )
+        self.handler.on_tool_end(output="ok", run_id=run_id2)
+        event2 = self.handler._sender.send.call_args[0][0]
+        assert event2["cost_tokens"] == 0
+
+    def test_token_usage_from_anthropic_and_usage_metadata_shapes(self) -> None:
+        from langchain_core.outputs import Generation, LLMResult
+
+        from vorlo_trace.handler import _extract_total_tokens
+
+        anthropic_shape = LLMResult(
+            generations=[[Generation(text="x")]],
+            llm_output={"usage": {"input_tokens": 40, "output_tokens": 2}},
+        )
+        assert _extract_total_tokens(anthropic_shape) == 42
+
+        class _Msg:
+            usage_metadata = {"input_tokens": 10, "output_tokens": 5}
+
+        class _Gen:
+            text = "x"
+            message = _Msg()
+
+        class _Result:
+            llm_output = None
+            generations = [[_Gen()]]
+
+        assert _extract_total_tokens(_Result()) == 15  # type: ignore[arg-type]
+
+        no_usage = LLMResult(generations=[[Generation(text="x")]])
+        assert _extract_total_tokens(no_usage) == 0
+
     def test_tool_error_sends_failed_event_with_diagnosis(self) -> None:
         run_id = uuid.uuid4()
         self.handler.on_tool_start(
