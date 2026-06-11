@@ -65,6 +65,11 @@ def _safe_str(value: Any) -> str:
         return "<unserializable>"
 
 
+def _scope(run_id: Optional[uuid.UUID]) -> str:
+    """Scope key for pending reasoning/tokens — the parent run, '' for flat runs."""
+    return str(run_id) if run_id else ""
+
+
 class VorloHandler(BaseCallbackHandler):
     """
     LangChain callback handler that captures agent execution steps
@@ -159,7 +164,7 @@ class VorloHandler(BaseCallbackHandler):
             tool_type = _classify_tool(tool_name)
             span_id = self._register_span(run_id)
             parent_span_id = self._resolve_parent_span(parent_run_id)
-            reasoning = self._session.consume_reasoning()
+            reasoning = self._session.consume_reasoning(scope=_scope(parent_run_id))
 
             self._active_steps[str(run_id)] = {
                 "step_number": step_number,
@@ -171,7 +176,7 @@ class VorloHandler(BaseCallbackHandler):
                 "parent_span_id": parent_span_id,
                 "reasoning": _truncate(reasoning, _MAX_REASONING_CHARS) if reasoning else "",
                 # Tokens spent by the LLM call(s) that decided this tool call
-                "cost_tokens": self._session.consume_tokens(),
+                "cost_tokens": self._session.consume_tokens(scope=_scope(parent_run_id)),
             }
         except Exception:
             pass  # never affect the agent
@@ -286,9 +291,12 @@ class VorloHandler(BaseCallbackHandler):
         """Called when the LLM starts generating. Captures the prompt as reasoning input."""
         try:
             self._register_span(run_id)
-            # Store the prompt — this becomes the "why" in step replay
+            # Store the prompt — this becomes the "why" in step replay.
+            # Scoped by parent run so parallel agents don't steal each other's reasoning.
             combined = "\n".join(prompts) if prompts else ""
-            self._session.set_reasoning(_truncate(combined, _MAX_REASONING_CHARS))
+            self._session.set_reasoning(
+                _truncate(combined, _MAX_REASONING_CHARS), scope=_scope(parent_run_id)
+            )
         except Exception:
             pass
 
@@ -303,16 +311,19 @@ class VorloHandler(BaseCallbackHandler):
         """Called when the LLM finishes generating. Captures the decision output."""
         try:
             self._release_span(run_id)
-            self._session.add_tokens(_extract_total_tokens(response))
+            scope = _scope(parent_run_id)
+            self._session.add_tokens(_extract_total_tokens(response), scope=scope)
             if response.generations:
                 # Get the text of the first generation — this contains the agent's decision
                 first_gen = response.generations[0]
                 if first_gen:
                     text = first_gen[0].text if first_gen[0].text else ""
                     # Append LLM output to reasoning so we capture both input and decision
-                    current = self._session.consume_reasoning() or ""
+                    current = self._session.consume_reasoning(scope=scope) or ""
                     combined = f"{current}\n---LLM OUTPUT---\n{text}" if current else text
-                    self._session.set_reasoning(_truncate(combined, _MAX_REASONING_CHARS))
+                    self._session.set_reasoning(
+                        _truncate(combined, _MAX_REASONING_CHARS), scope=scope
+                    )
         except Exception:
             pass
 
@@ -328,8 +339,14 @@ class VorloHandler(BaseCallbackHandler):
     ) -> None:
         """Called when the agent decides which tool to call."""
         try:
+            # Agent actions fire on the executor's chain run, and tools started
+            # by that executor get THIS run_id as their parent — so the scope
+            # for the upcoming tool is run_id, not parent_run_id. The LLM call
+            # that produced this decision stored its reasoning under the same
+            # scope (its parent is also the executor run).
+            scope = _scope(run_id)
             reasoning_parts = []
-            current = self._session.consume_reasoning()
+            current = self._session.consume_reasoning(scope=scope)
             if current:
                 reasoning_parts.append(current)
             reasoning_parts.append(
@@ -339,7 +356,7 @@ class VorloHandler(BaseCallbackHandler):
             if action.log:
                 reasoning_parts.append(f"Agent reasoning: {_truncate(action.log, 1000)}")
             self._session.set_reasoning(
-                _truncate("\n".join(reasoning_parts), _MAX_REASONING_CHARS)
+                _truncate("\n".join(reasoning_parts), _MAX_REASONING_CHARS), scope=scope
             )
         except Exception:
             pass
@@ -470,7 +487,9 @@ class VorloHandler(BaseCallbackHandler):
                 for msg in msg_list:
                     all_messages.append(f"[{msg.type}] {msg.content}")
             combined = "\n".join(all_messages)
-            self._session.set_reasoning(_truncate(combined, _MAX_REASONING_CHARS))
+            self._session.set_reasoning(
+                _truncate(combined, _MAX_REASONING_CHARS), scope=_scope(parent_run_id)
+            )
         except Exception:
             pass
 

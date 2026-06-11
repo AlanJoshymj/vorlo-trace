@@ -117,6 +117,49 @@ class TestHandlerToolCallbacks:
         assert event["tool_type"] == "sensor"
         assert event["step_number"] == 1
 
+    def test_parallel_agents_do_not_swap_reasoning(self) -> None:
+        """Reasoning is scoped by parent run — two agents running tools
+        concurrently must each get their own LLM's reasoning."""
+        from langchain_core.outputs import Generation, LLMResult
+
+        parent_a, parent_b = uuid.uuid4(), uuid.uuid4()
+
+        self.handler.on_llm_start(
+            serialized={}, prompts=["plan for agent A"],
+            run_id=uuid.uuid4(), parent_run_id=parent_a,
+        )
+        self.handler.on_llm_start(
+            serialized={}, prompts=["plan for agent B"],
+            run_id=uuid.uuid4(), parent_run_id=parent_b,
+        )
+
+        # Agent B's tool starts FIRST — under the old single-slot model it
+        # would have stolen whichever reasoning was written last.
+        tool_b, tool_a = uuid.uuid4(), uuid.uuid4()
+        self.handler.on_tool_start(
+            serialized={"name": "tool_b"}, input_str="", run_id=tool_b, parent_run_id=parent_b
+        )
+        self.handler.on_tool_start(
+            serialized={"name": "tool_a"}, input_str="", run_id=tool_a, parent_run_id=parent_a
+        )
+
+        assert "agent B" in self.handler._active_steps[str(tool_b)]["reasoning"]
+        assert "agent A" in self.handler._active_steps[str(tool_a)]["reasoning"]
+
+    def test_single_agent_reasoning_survives_mismatched_parents(self) -> None:
+        """Nested runnable chains can give the LLM a different parent than the
+        tool — with one agent running, the sole pending entry must still attach."""
+        self.handler.on_llm_start(
+            serialized={}, prompts=["the only plan"],
+            run_id=uuid.uuid4(), parent_run_id=uuid.uuid4(),  # some inner chain
+        )
+        tool_run = uuid.uuid4()
+        self.handler.on_tool_start(
+            serialized={"name": "tool_x"}, input_str="",
+            run_id=tool_run, parent_run_id=uuid.uuid4(),  # different parent
+        )
+        assert "the only plan" in self.handler._active_steps[str(tool_run)]["reasoning"]
+
     def test_token_usage_is_attached_to_the_next_step(self) -> None:
         from langchain_core.outputs import Generation, LLMResult
 
