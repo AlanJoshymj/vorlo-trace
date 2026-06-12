@@ -19,7 +19,7 @@ from typing import Any, Callable, Optional
 
 from vorlo_trace.handler import VorloHandler
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["init", "get_handler", "trace", "VorloHandler"]
 
 # Module-level singleton — one handler per process

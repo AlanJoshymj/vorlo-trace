@@ -66,6 +66,21 @@ All sends are **fire-and-forget** — Vorlo never slows or crashes your agent, e
 - **OTel-compatible** — trace_id, span_id for enterprise export
 - **Zero impact** — async sends, daemon threads, silent failures
 
+## MCP server — debug from inside your editor
+
+The package ships an MCP server (`vorlo-mcp`), so Claude Code / Cursor / any
+MCP client can ask Vorlo *"why did my last run fail?"* without leaving the editor:
+
+```bash
+pip install vorlo-trace
+claude mcp add vorlo --env VORLO_API_KEY=vrlo_... -- vorlo-mcp
+# or without installing first:
+claude mcp add vorlo --env VORLO_API_KEY=vrlo_... -- uvx --from vorlo-trace vorlo-mcp
+```
+
+Tools: `why_did_my_last_run_fail`, `get_session_diagnosis`,
+`list_recent_sessions`, `get_failure_clusters`.
+
 ## Configuration
 
 ```python
