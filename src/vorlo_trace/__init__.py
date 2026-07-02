@@ -1,15 +1,18 @@
 """
-Vorlo Trace — AI agent observability SDK.
+Vorlo Trace — the debugger for AI agents.
 
 Add 2 lines of code to see exactly why your agent failed:
 
     import vorlo_trace
     vorlo_trace.init(api_key="vrlo_...", agent_name="my-agent")
 
-    # Then pass the handler to your agent:
+    # LangChain — pass the handler to your agent:
     agent.invoke({"input": "..."}, config={"callbacks": [vorlo_trace.get_handler()]})
 
-    # Or use the convenience wrapper:
+    # OpenAI Agents SDK — instrument once, then every Runner.run is traced:
+    vorlo_trace.instrument_openai_agents()
+
+    # Or use the convenience wrapper (LangChain):
     vorlo_trace.trace(agent, input="...")
 """
 from __future__ import annotations
@@ -19,11 +22,17 @@ from typing import Any, Callable, Optional
 
 from vorlo_trace.handler import VorloHandler
 
-__version__ = "0.3.0"
-__all__ = ["init", "get_handler", "trace", "VorloHandler"]
+__version__ = "0.4.0"
+__all__ = ["init", "get_handler", "trace", "instrument_openai_agents", "VorloHandler"]
 
 # Module-level singleton — one handler per process
 _handler: Optional[VorloHandler] = None
+
+# Resolved init() config, reused by framework adapters (OpenAI Agents SDK).
+_config: dict[str, Any] = {}
+
+# Singleton adapter — instrument_openai_agents() is idempotent.
+_openai_processor: Optional[Any] = None
 
 # Default server URL — points to Vorlo production server
 _DEFAULT_SERVER_URL = "https://vorlo-server-production.up.railway.app"
@@ -77,6 +86,13 @@ def init(
         verify_env = os.environ.get("VORLO_VERIFY_SSL", "").lower()
         resolved_verify_ssl = verify_env not in ("0", "false", "no", "off")
 
+    _config.update({
+        "server_url": resolved_url,
+        "api_key": resolved_key,
+        "agent_name": agent_name,
+        "verify_ssl": resolved_verify_ssl,
+        "redact": redact,
+    })
     _handler = VorloHandler(
         server_url=resolved_url,
         api_key=resolved_key,
@@ -102,6 +118,55 @@ def get_handler() -> VorloHandler:
             "Vorlo is not initialized. Call vorlo_trace.init(api_key='vrlo_...') first."
         )
     return _handler
+
+
+def instrument_openai_agents() -> Any:
+    """
+    Instrument the OpenAI Agents SDK — every Runner.run() becomes a Vorlo
+    session with numbered tool steps, diagnoses, and replay.
+
+    Call once, after init():
+
+        vorlo_trace.init(api_key="vrlo_...", agent_name="my-agent")
+        vorlo_trace.instrument_openai_agents()
+
+    Idempotent: calling it again returns the existing processor.
+
+    Returns:
+        The registered VorloTraceProcessor.
+
+    Raises:
+        RuntimeError: If init() has not been called yet.
+        ImportError: If the `openai-agents` package is not installed.
+    """
+    global _openai_processor
+    if _openai_processor is not None:
+        return _openai_processor
+
+    if not _config:
+        raise RuntimeError(
+            "Vorlo is not initialized. Call vorlo_trace.init(api_key='vrlo_...') first."
+        )
+
+    try:
+        from agents.tracing import add_trace_processor
+    except ImportError as exc:
+        raise ImportError(
+            "The OpenAI Agents SDK is not installed. "
+            "Run: pip install openai-agents"
+        ) from exc
+
+    from vorlo_trace.openai_agents import VorloTraceProcessor
+
+    _openai_processor = VorloTraceProcessor(
+        server_url=_config["server_url"],
+        api_key=_config["api_key"],
+        agent_name=_config["agent_name"],
+        verify_ssl=_config["verify_ssl"],
+        redact=_config["redact"],
+    )
+    add_trace_processor(_openai_processor)
+    return _openai_processor
 
 
 def trace(agent: Any, input: Optional[str] = None, **kwargs: Any) -> Any:

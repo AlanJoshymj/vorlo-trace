@@ -1,15 +1,16 @@
 # vorlo-trace
 
-> "LangSmith tells you what your agent did. Langfuse shows you where it happened.
-> **Vorlo tells you exactly WHY it failed and what to fix — in 30 seconds.**"
+The debugger for AI agents. Add 2 lines of code to see exactly which step of your agent failed, the plain-English root cause, and the exact fix — in 30 seconds.
 
-AI agent observability SDK. Add 2 lines of code to see exactly which step of your agent failed, the plain-English root cause, and a specific fix hint.
+Works with **LangChain** and the **OpenAI Agents SDK**.
 
 ## Quick Start
 
 ```bash
 pip install vorlo-trace
 ```
+
+### LangChain
 
 ```python
 import vorlo_trace
@@ -25,6 +26,24 @@ result = agent_executor.invoke(
     config={"callbacks": [handler]}
 )
 ```
+
+### OpenAI Agents SDK
+
+```python
+import vorlo_trace
+from agents import Agent, Runner
+
+# 1. Initialize Vorlo (or set VORLO_API_KEY env var)
+vorlo_trace.init(api_key="vrlo_your_key_here", agent_name="my-agent")
+
+# 2. Instrument once — every Runner.run() is traced from here on
+vorlo_trace.instrument_openai_agents()
+
+result = await Runner.run(agent, "Check my latest emails")
+```
+
+Tool calls, handoffs between agents, and triggered guardrails all appear
+as numbered steps — failures carry a plain-English diagnosis and fix.
 
 That's it. Open [vorlo.dev](https://vorlo.dev) to see every step your agent took, with:
 
@@ -60,7 +79,7 @@ All sends are **fire-and-forget** — Vorlo never slows or crashes your agent, e
 
 ## Features
 
-- **2-line integration** — works with any LangChain agent
+- **2-line integration** — works with any LangChain agent or the OpenAI Agents SDK
 - **Sensor/Actuator classification** — reads vs writes, clearly labeled
 - **Cross-step root cause** — understands data flow between steps
 - **OTel-compatible** — trace_id, span_id for enterprise export

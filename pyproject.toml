@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vorlo-trace"
-version = "0.3.0"
-description = "AI agent observability SDK — see exactly why your agent failed, in 30 seconds."
+version = "0.4.0"
+description = "The debugger for AI agents — add 2 lines, replay every run, get the plain-English root cause and exact fix in 30 seconds."
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -14,7 +14,8 @@ authors = [
 ]
 keywords = [
     "ai", "agent", "observability", "debugging", "langchain",
-    "tracing", "llm", "mcp", "step-replay", "vorlo",
+    "openai-agents", "openai agents sdk", "tracing", "llm", "mcp",
+    "step-replay", "vorlo",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -36,6 +37,7 @@ dependencies = [
 
 [project.optional-dependencies]
 async = ["httpx>=0.24.0"]
+openai = ["openai-agents>=0.1.0"]
 examples = [
     "langchain-openai>=0.1.0",
     "langgraph>=0.1.0",
