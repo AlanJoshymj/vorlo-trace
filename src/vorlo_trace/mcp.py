@@ -25,7 +25,7 @@ from urllib.parse import quote
 import requests
 
 SERVER_NAME = "vorlo"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.5.0"
 _DEFAULT_SERVER_URL = "https://vorlo-server-production.up.railway.app"
 
 
@@ -35,21 +35,53 @@ def _api_base() -> str:
     return (os.environ.get("VORLO_SERVER_URL") or _DEFAULT_SERVER_URL).rstrip("/")
 
 
-def _vorlo_get(path: str) -> dict[str, Any]:
+def _api_key() -> str:
     api_key = os.environ.get("VORLO_API_KEY", "")
     if not api_key:
         raise RuntimeError(
             "VORLO_API_KEY is not set. Create a key at https://www.vorlo.dev/settings "
             "and add it to the MCP server env."
         )
+    return api_key
+
+
+def _vorlo_get(path: str) -> dict[str, Any]:
     res = requests.get(
         f"{_api_base()}{path}",
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers={"Authorization": f"Bearer {_api_key()}"},
         timeout=15,
     )
     if not res.ok:
         raise RuntimeError(f"Vorlo API {path} responded {res.status_code}")
     return res.json()
+
+
+def _vorlo_post(path: str, body: dict[str, Any]) -> dict[str, Any]:
+    res = requests.post(
+        f"{_api_base()}{path}",
+        headers={"Authorization": f"Bearer {_api_key()}"},
+        json=body,
+        timeout=15,
+    )
+    if not res.ok:
+        raise RuntimeError(f"Vorlo API {path} responded {res.status_code}")
+    return res.json()
+
+
+def _latest_failed_session() -> Optional[dict[str, Any]]:
+    """Full detail of the most recent failed session, or None."""
+    listing = _vorlo_get("/v1/sessions?page=1&status=failed")
+    sessions = listing.get("sessions") or []
+    if not sessions:
+        return None
+    return _vorlo_get(f"/v1/sessions/{quote(str(sessions[0].get('session_id')))}")
+
+
+def _failed_step(session: dict[str, Any]) -> Optional[dict[str, Any]]:
+    return next(
+        (s for s in (session.get("steps") or []) if s.get("status") == "failed"),
+        None,
+    )
 
 
 # ── Formatters ────────────────────────────────────────────────────────────
@@ -129,6 +161,82 @@ def format_clusters(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+_CONFIDENCE_NOTES = {
+    "verified": (
+        "VERIFIED — this exact fix worked before (confirmed by a developer or "
+        "by the error stopping). Apply it with confidence."
+    ),
+    "likely": (
+        "LIKELY — matched a curated error pattern, not an AI guess. "
+        "Apply it, then confirm the outcome."
+    ),
+    "guess": (
+        "GUESS — an unconfirmed hypothesis from a fresh diagnosis. "
+        "Verify it against the code before applying."
+    ),
+}
+
+
+def format_fix_briefing(session: dict[str, Any]) -> str:
+    """Structured patch briefing for a coding agent to act on."""
+    session_id = session.get("session_id", "")
+    failed = _failed_step(session)
+    if failed is None:
+        return (
+            f"Session {session_id} has no failed step — nothing to fix. "
+            "Use why_did_my_last_run_fail to find the latest failure."
+        )
+
+    tool_name = failed.get("tool_name", "unknown")
+    confidence = (failed.get("error_confidence") or "guess").lower()
+    steps = session.get("steps") or []
+
+    lines = [
+        f"# Vorlo Fix Briefing — session {session_id}",
+        "",
+        "## Failure",
+        f"Agent: {session.get('agent_name', 'unknown')}",
+        f"Step {failed.get('step_number', '?')} of {len(steps)} — tool `{tool_name}` "
+        f"({failed.get('tool_type') or 'unknown'}) failed after {failed.get('latency_ms', 0)}ms",
+        f"Error: {failed.get('error') or failed.get('error_title') or 'unknown'}",
+        "",
+        f"## Diagnosis ({_CONFIDENCE_NOTES.get(confidence, confidence)})",
+    ]
+    if failed.get("error_root_cause"):
+        lines.append(f"Root cause: {failed['error_root_cause']}")
+    if failed.get("error_plain_english"):
+        lines.append(f"What happened: {failed['error_plain_english']}")
+    lines.append(f"Fix: {failed.get('error_fix_hint') or 'No fix hint available — inspect the context below.'}")
+
+    lines.append("")
+    lines.append("## Context")
+    if failed.get("input"):
+        lines.append(f"Tool input: {str(failed['input'])[:800]}")
+    if failed.get("reasoning"):
+        lines.append(f"Agent reasoning before the call: {str(failed['reasoning'])[:800]}")
+    prior = [s for s in steps if s.get("step_number", 0) < failed.get("step_number", 0)]
+    if prior:
+        lines.append("Steps before the failure:")
+        for s in prior:
+            mark = "✗" if s.get("status") == "failed" else "✓"
+            lines.append(f"  {mark} {s.get('step_number', '?')}. {s.get('tool_name', 'unknown')}")
+
+    lines += [
+        "",
+        "## Apply the fix",
+        f"1. Locate where tool `{tool_name}` is defined, configured, or called in this "
+        f"codebase (search for \"{tool_name}\").",
+        "2. Apply the fix described in the Diagnosis section.",
+        "3. Re-run the agent to confirm the failure is gone.",
+        f"4. IMPORTANT: report the outcome by calling the Vorlo MCP tool `confirm_fix` "
+        f"with session_id=\"{session_id}\" and worked=true (or false). A confirmed fix "
+        "is promoted to VERIFIED and served to every developer who hits this failure next.",
+        "",
+        f"Replay: https://www.vorlo.dev/sessions/{session_id}",
+    ]
+    return "\n".join(lines)
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────
 
 TOOLS = [
@@ -183,6 +291,51 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "propose_fix",
+        "description": (
+            "Get a ready-to-apply fix briefing for a failed agent run: the diagnosis, "
+            "its confidence (verified fixes have worked before), the failing tool's "
+            "input and reasoning context, and step-by-step instructions to apply the "
+            "fix in this codebase. Defaults to the most recent failed run. After "
+            "applying, report back with confirm_fix."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "Vorlo session id (defaults to the latest failed run)",
+                }
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "confirm_fix",
+        "description": (
+            "Report whether a fix from propose_fix actually worked. worked=true "
+            "promotes the diagnosis to VERIFIED for every developer who hits this "
+            "failure next; worked=false lowers its confidence. Optionally pass "
+            "better_fix with what actually fixed it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "required": ["worked"],
+            "properties": {
+                "worked": {"type": "boolean", "description": "Did the fix resolve the failure?"},
+                "session_id": {
+                    "type": "string",
+                    "description": "Vorlo session id (defaults to the latest failed run)",
+                },
+                "better_fix": {
+                    "type": "string",
+                    "description": "If a different fix worked, describe it — it becomes the served fix",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -212,6 +365,56 @@ def call_tool(name: str, args: dict[str, Any]) -> str:
         days = int(args.get("days") or 7)
         data = _vorlo_get(f"/v1/sessions/failure-clusters?days={days}")
         return format_clusters(data)
+
+    if name == "propose_fix":
+        session_id = str(args.get("session_id") or "")
+        if session_id:
+            session = _vorlo_get(f"/v1/sessions/{quote(session_id)}")
+        else:
+            session = _latest_failed_session()
+            if session is None:
+                return "No failed runs found — the most recent sessions all succeeded."
+        return format_fix_briefing(session)
+
+    if name == "confirm_fix":
+        worked = bool(args.get("worked"))
+        session_id = str(args.get("session_id") or "")
+        better_fix = str(args.get("better_fix") or "").strip()
+
+        if session_id:
+            session = _vorlo_get(f"/v1/sessions/{quote(session_id)}")
+        else:
+            session = _latest_failed_session()
+            if session is None:
+                return "No failed runs found — nothing to confirm."
+        failed = _failed_step(session)
+        if failed is None:
+            return f"Session {session.get('session_id', '')} has no failed step — nothing to confirm."
+
+        # The step's stored error is exactly what the server fingerprinted, so
+        # echoing it verbatim attributes this verdict to the right diagnosis.
+        result = _vorlo_post("/v1/feedback", {
+            "tool_name": failed.get("tool_name", ""),
+            "error": failed.get("error", ""),
+            "helpful": worked,
+            "fix": better_fix,
+        })
+
+        confidence = result.get("confidence", "")
+        if worked:
+            lines = ["Fix outcome recorded: WORKED ✓"]
+            if confidence == "verified":
+                lines.append(
+                    "This diagnosis is now VERIFIED — its fix will be served to every "
+                    "developer who hits this failure next. The library just got smarter."
+                )
+            if better_fix:
+                lines.append("Your improved fix replaced the original hint.")
+            return "\n".join(lines)
+        return (
+            "Fix outcome recorded: did not work. The diagnosis's confidence was "
+            "lowered so it is not trusted blindly."
+        )
 
     raise ValueError(f"Unknown tool: {name}")
 

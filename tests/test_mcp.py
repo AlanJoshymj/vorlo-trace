@@ -19,8 +19,11 @@ FAILED_SESSION = {
         {
             "step_number": 2,
             "tool_name": "charge_card",
+            "tool_type": "actuator",
             "status": "failed",
             "latency_ms": 400,
+            "input": '{"amount": 4200}',
+            "error": "Stripe rejected the credentials — the API key expired.",
             "error_title": "Stripe authentication failed",
             "error_root_cause": "The API key expired.",
             "error_fix_hint": "Rotate the Stripe key.",
@@ -74,6 +77,8 @@ class TestProtocol:
             "get_session_diagnosis",
             "list_recent_sessions",
             "get_failure_clusters",
+            "propose_fix",
+            "confirm_fix",
         ]
 
     def test_unknown_method_and_notifications(self) -> None:
@@ -135,6 +140,82 @@ class TestTools:
         assert "[failed] sess_9 · mail-agent · 4 steps — Gmail rate limit" in listed
         assert "OAuth/authentication failures — 5 sessions" in clusters
         assert "Fix: Reconnect the account" in clusters
+
+
+def _mock_post(captured: list[dict[str, Any]], response: dict[str, Any]):
+    """Patch requests.post, capturing the JSON body and serving a response."""
+
+    def fake_post(url: str, **kwargs: Any) -> MagicMock:
+        captured.append(kwargs.get("json") or {})
+        res = MagicMock(ok=True, status_code=200)
+        res.json.return_value = response
+        return res
+
+    return patch.object(mcp.requests, "post", side_effect=fake_post)
+
+
+class TestAutofixLoop:
+    def test_propose_fix_briefing(self) -> None:
+        with _mock_api({
+            "/v1/sessions?page=1&status=failed": {"sessions": [{"session_id": "sess_1"}]},
+            "/v1/sessions/sess_1": FAILED_SESSION,
+        }):
+            text = mcp.call_tool("propose_fix", {})
+        assert "# Vorlo Fix Briefing — session sess_1" in text
+        assert "tool `charge_card`" in text
+        assert "VERIFIED — this exact fix worked before" in text
+        assert "Fix: Rotate the Stripe key." in text
+        assert 'Tool input: {"amount": 4200}' in text
+        assert "✓ 1. get_order" in text  # prior steps listed
+        assert 'confirm_fix' in text  # loop-closing instruction
+        assert 'session_id="sess_1"' in text
+
+    def test_propose_fix_no_failures(self) -> None:
+        with _mock_api({"/v1/sessions?page=1&status=failed": {"sessions": []}}):
+            text = mcp.call_tool("propose_fix", {})
+        assert "No failed runs" in text
+
+    def test_propose_fix_on_clean_session(self) -> None:
+        clean = {"session_id": "sess_ok", "agent_name": "a", "steps": [
+            {"step_number": 1, "tool_name": "get_x", "status": "success", "latency_ms": 5},
+        ]}
+        with _mock_api({"/v1/sessions/sess_ok": clean}):
+            text = mcp.call_tool("propose_fix", {"session_id": "sess_ok"})
+        assert "no failed step" in text
+
+    def test_confirm_fix_worked_promotes(self) -> None:
+        captured: list[dict[str, Any]] = []
+        with _mock_api({"/v1/sessions/sess_1": FAILED_SESSION}), _mock_post(
+            captured, {"ok": True, "found": True, "confidence": "verified"}
+        ):
+            text = mcp.call_tool("confirm_fix", {"session_id": "sess_1", "worked": True})
+        assert captured[0]["tool_name"] == "charge_card"
+        # The step's stored error is echoed verbatim — same fingerprint server-side
+        assert captured[0]["error"] == "Stripe rejected the credentials — the API key expired."
+        assert captured[0]["helpful"] is True
+        assert "WORKED" in text
+        assert "VERIFIED" in text
+
+    def test_confirm_fix_failed_lowers_confidence(self) -> None:
+        captured: list[dict[str, Any]] = []
+        with _mock_api({"/v1/sessions/sess_1": FAILED_SESSION}), _mock_post(
+            captured, {"ok": True, "found": True, "confidence": "guess"}
+        ):
+            text = mcp.call_tool("confirm_fix", {"session_id": "sess_1", "worked": False})
+        assert captured[0]["helpful"] is False
+        assert "did not work" in text
+
+    def test_confirm_fix_passes_better_fix(self) -> None:
+        captured: list[dict[str, Any]] = []
+        with _mock_api({"/v1/sessions/sess_1": FAILED_SESSION}), _mock_post(
+            captured, {"ok": True, "found": True, "confidence": "verified"}
+        ):
+            text = mcp.call_tool("confirm_fix", {
+                "session_id": "sess_1", "worked": True,
+                "better_fix": "Use the restricted key from Settings.",
+            })
+        assert captured[0]["fix"] == "Use the restricted key from Settings."
+        assert "improved fix" in text
 
 
 class TestFormatters:

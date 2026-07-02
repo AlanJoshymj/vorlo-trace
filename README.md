@@ -98,7 +98,13 @@ claude mcp add vorlo --env VORLO_API_KEY=vrlo_... -- uvx --from vorlo-trace vorl
 ```
 
 Tools: `why_did_my_last_run_fail`, `get_session_diagnosis`,
-`list_recent_sessions`, `get_failure_clusters`.
+`list_recent_sessions`, `get_failure_clusters`, `propose_fix`, `confirm_fix`.
+
+**The autofix loop:** ask your coding assistant to fix your agent — it calls
+`propose_fix` (a ready-to-apply briefing: diagnosis, confidence, context,
+instructions), applies the fix in your code, re-runs, and reports back with
+`confirm_fix`. A confirmed fix is promoted to **verified** and served to every
+developer who hits the same failure next.
 
 ## Configuration
 

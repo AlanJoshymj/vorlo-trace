@@ -22,7 +22,7 @@ from typing import Any, Callable, Optional
 
 from vorlo_trace.handler import VorloHandler
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __all__ = ["init", "get_handler", "trace", "instrument_openai_agents", "VorloHandler"]
 
 # Module-level singleton — one handler per process
