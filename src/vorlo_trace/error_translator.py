@@ -57,7 +57,7 @@ _PATTERNS: list[dict[str, Any]] = [
     {
         "tool_prefix": "salesforce",
         "statuses": {401, 403},
-        "message_re": re.compile(r"(unauthorized|session.expired|invalid.session|token)", re.I),
+        "message_re": re.compile(r"(unauthorized|session.{0,10}expired|invalid.{0,10}session|token)", re.I),
         "build": lambda ctx: ErrorDiagnosis(
             code="salesforce_token_expired",
             title="Salesforce OAuth token expired or invalid",
@@ -80,7 +80,10 @@ _PATTERNS: list[dict[str, Any]] = [
     {
         "tool_prefix": "gmail",
         "statuses": {401, 403},
-        "message_re": re.compile(r"(invalid.credentials|token.expired|insufficient.permission|forbidden)", re.I),
+        "message_re": re.compile(
+            r"(invalid.credentials|invalid_grant|token.{0,30}(expired|revoked)|expired.{0,30}token|insufficient.permission|forbidden)",
+            re.I,
+        ),
         "build": lambda ctx: ErrorDiagnosis(
             code="gmail_auth_error",
             title="Gmail authentication or permission error",
@@ -327,9 +330,202 @@ _EXCEPTION_PATTERNS: list[dict[str, Any]] = [
 ]
 
 
+# ── Message-shape patterns: agent-behavior failures ──────────────────────
+# These are the most agent-specific failures there are (parser drift,
+# iteration loops, hallucinated tools, context overflow), but they surface
+# under many different exception class names, so they're matched on message
+# shape. Diagnoses mirror the public Failure Index at vorlo.dev/failures.
+
+_MESSAGE_PATTERNS: list[dict[str, Any]] = [
+    {
+        "message_re": re.compile(
+            r"(could not parse.{0,20}output|output ?parser|failed to parse.{0,30}(output|response))", re.I
+        ),
+        "build": lambda ctx: ErrorDiagnosis(
+            code="output_parsing_error",
+            title="Model output didn't match the expected format",
+            plain_english=(
+                "The model's reply didn't match the format the agent framework "
+                "expected (an action block or JSON schema), so the framework "
+                "couldn't extract the next step and gave up."
+            ),
+            root_cause=(
+                "Models drift out of format — smaller models especially, and any "
+                "model on long contexts. One malformed reply kills the run when "
+                "there's no retry-on-parse-failure configured."
+            ),
+            fix_hint=(
+                "Enable parse-error retries (handle_parsing_errors=True in "
+                "LangChain), keep format instructions at the END of the prompt, "
+                "or switch to native tool-calling / structured output so format "
+                "compliance is the provider's job."
+            ),
+            severity="warning",
+            docs_url="https://vorlo.dev/failures/langchain-output-parser-exception",
+        ),
+    },
+    {
+        "message_re": re.compile(
+            r"(iteration limit|time limit|max.{0,10}(iterations|turns)|maxturns)", re.I
+        ),
+        "build": lambda ctx: ErrorDiagnosis(
+            code="max_iterations_exceeded",
+            title="Agent hit its iteration limit — usually a loop",
+            plain_english=(
+                "The agent used up its step budget before finishing. Nine times "
+                "out of ten this is a loop: a failing tool being retried, or the "
+                "model oscillating between tools."
+            ),
+            root_cause=_iteration_loop_root_cause(ctx),
+            fix_hint=(
+                "Read the steps and find the repetition. Fix the failing tool or "
+                "the ambiguous tool descriptions causing oscillation. Only raise "
+                "max_iterations if the trace shows real, non-repeating progress "
+                "being cut off."
+            ),
+            severity="warning",
+            docs_url="https://vorlo.dev/failures/agent-stopped-iteration-limit",
+        ),
+    },
+    {
+        "message_re": re.compile(
+            r"(is not a valid tool|unknown tool|no tool named|tool.{0,20}not found)", re.I
+        ),
+        "build": lambda ctx: ErrorDiagnosis(
+            code="tool_not_found",
+            title="Agent called a tool that doesn't exist",
+            plain_english=(
+                "The model asked for a tool name that isn't registered — usually "
+                "a near-miss of a real tool's name, or a capability the prompt "
+                "implied but never provided."
+            ),
+            root_cause=(
+                "Ambiguous or overlapping tool names invite the model to "
+                "generalize: if the naming pattern suggests a tool should exist, "
+                "it will try to call it. "
+                + _suggested_tools_note(ctx)
+            ),
+            fix_hint=(
+                "Rename tools so each is unambiguous, keep the toolbox small "
+                "(5-10 well-named tools beat 40 vague ones), and make sure the "
+                "system prompt never mentions capabilities that aren't registered."
+            ),
+            severity="warning",
+            docs_url="https://vorlo.dev/failures/agent-tool-not-found-hallucinated",
+        ),
+    },
+    {
+        "message_re": re.compile(
+            r"(maximum context length|context.{0,20}(length|window).{0,20}exceed|too many tokens|prompt is too long)",
+            re.I,
+        ),
+        "build": lambda ctx: ErrorDiagnosis(
+            code="context_length_exceeded",
+            title="The run outgrew the model's context window",
+            plain_english=(
+                "Every step appends tool output to the conversation, and this "
+                "run grew past the model's limit — usually because one tool "
+                "dumped a huge payload into the transcript."
+            ),
+            root_cause=(
+                "Unbounded tool outputs. One verbose step (a scraper returning "
+                "full HTML, a query returning thousands of rows) eats most of "
+                "the window, and the failure surfaces steps later when the next "
+                "model call no longer fits."
+            ),
+            fix_hint=(
+                "Find the step whose output exploded the token count and cap it "
+                "at the source: truncate or summarize tool results before they "
+                "enter the transcript, or return references instead of payloads."
+            ),
+            severity="critical",
+            docs_url="https://vorlo.dev/failures/agent-context-window-exceeded",
+        ),
+    },
+    {
+        "message_re": re.compile(
+            r"(validation error for|is not a valid enumeration|field required|input should be)", re.I
+        ),
+        "build": lambda ctx: ErrorDiagnosis(
+            code="schema_validation_error",
+            title="Tool arguments failed schema validation",
+            plain_english=(
+                f"The model called '{ctx['tool_name']}' with arguments that "
+                "don't match the tool's schema — a wrong enum value, a missing "
+                "required field, or the wrong type."
+            ),
+            root_cause=(
+                "The tool's description doesn't tell the model enough about the "
+                "allowed values, so it guessed. Validation caught the guess."
+            ),
+            fix_hint=(
+                "Spell out allowed values and required fields in the tool's "
+                "description (models follow docstrings), and prefer native "
+                "structured-output modes that constrain arguments to the schema."
+            ),
+            severity="warning",
+            docs_url="https://vorlo.dev/failures/keyerror-missing-field-agent-step",
+        ),
+    },
+    {
+        "message_re": re.compile(r"(guardrail|tripwire)", re.I),
+        "build": lambda ctx: ErrorDiagnosis(
+            code="guardrail_triggered",
+            title="A guardrail stopped the run",
+            plain_english=(
+                "An input or output guardrail fired and blocked the run. That's "
+                "correct behavior if the input was genuinely bad — but "
+                "miscalibrated guardrails block legitimate traffic too."
+            ),
+            root_cause=(
+                "Either the input truly matched a threat pattern, or the "
+                "guardrail's condition is broader than intended (over-eager "
+                "regexes and over-sensitive classifiers are common)."
+            ),
+            fix_hint=(
+                "Log WHAT the guardrail matched, not just that it fired. Replay "
+                "the blocked input against the guardrail in isolation; if it's a "
+                "false positive, tighten the condition to the actual threat."
+            ),
+            severity="warning",
+            docs_url="https://vorlo.dev/failures/agent-guardrail-triggered-blocked",
+        ),
+    },
+]
+
+
 # ---------------------------------------------------------------------------
 # Helper functions for building context-aware root causes
 # ---------------------------------------------------------------------------
+
+
+def _iteration_loop_root_cause(ctx: dict[str, Any]) -> str:
+    """Iteration-limit root cause, naming the repeated tool when visible."""
+    base = (
+        "The step budget ran out before the task finished. Raising the limit "
+        "without reading the trace just makes the loop more expensive."
+    )
+    prev = ctx.get("previous_steps") or []
+    if prev:
+        from collections import Counter
+
+        counts = Counter(s.get("tool_name", "") for s in prev if s.get("tool_name"))
+        if counts:
+            tool, n = counts.most_common(1)[0]
+            if n >= 3:
+                return (
+                    f"'{tool}' was called {n} times in the last {len(prev)} steps — "
+                    "the agent is looping on it. " + base
+                )
+    return base
+
+
+def _suggested_tools_note(ctx: dict[str, Any]) -> str:
+    """Pull the framework's 'try one of [...]' suggestion into the diagnosis."""
+    m = re.search(r"try one of \[([^\]]+)\]", ctx.get("raw_message", ""), re.I)
+    if m:
+        return f"Registered tools reported by the framework: {m.group(1)}."
+    return ""
 
 def _auth_root_cause(ctx: dict[str, Any]) -> str:
     """Build an auth-specific root cause that includes cross-step context."""
@@ -437,6 +633,7 @@ def translate_error(
         previous_steps = []
 
     tool_lower = tool_name.lower()
+    raw_lower = raw_message.lower()
     # Derive a tool prefix for pattern matching (e.g., "stripe" from "stripe_charge_card")
     tool_prefix = tool_lower.split("_")[0] if "_" in tool_lower else tool_lower
 
@@ -449,16 +646,32 @@ def translate_error(
         "previous_steps": previous_steps,
     }
 
-    # Try HTTP-status-based patterns first (more specific patterns first)
+    # Try HTTP-status-based patterns first (more specific patterns first).
+    # Provider patterns match on the tool NAME (stripe_charge) or the error
+    # TEXT ("Stripe API error: ..."): real tools are named charge_card, not
+    # stripe_charge_card, so the provider's own error message is usually the
+    # only reliable signal. Matching on name alone misrouted provider errors
+    # to the generic auth patterns (or worse, to the wrong diagnosis).
     if http_status is not None:
         for pattern in _PATTERNS:
             prefix = pattern["tool_prefix"]
-            if prefix is not None and not tool_lower.startswith(prefix):
+            if prefix is not None and not (
+                tool_lower.startswith(prefix) or prefix in raw_lower
+            ):
                 continue
             if http_status not in pattern["statuses"]:
                 continue
             if not pattern["message_re"].search(raw_message):
                 continue
+            return pattern["build"](ctx)
+
+    # Message-shape patterns: agent-behavior failures (parser drift, iteration
+    # limits, hallucinated tools, context overflow...) arrive under many
+    # exception class names, so they're recognized by what the message SAYS.
+    # Checked before the broad exception-type patterns because a distinctive
+    # message is stronger evidence than an exception class.
+    for pattern in _MESSAGE_PATTERNS:
+        if pattern["message_re"].search(raw_message):
             return pattern["build"](ctx)
 
     # Try exception-type-based patterns

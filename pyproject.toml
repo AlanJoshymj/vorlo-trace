@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vorlo-trace"
-version = "0.5.0"
+version = "0.5.1"
 description = "The debugger for AI agents — add 2 lines, replay every run, get the plain-English root cause and exact fix in 30 seconds."
 readme = "README.md"
 license = {text = "MIT"}
